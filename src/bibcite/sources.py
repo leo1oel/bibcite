@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 
 import httpx
 
-from .normalize import clean_title, mini_hash, norm_title
+from .normalize import clean_title, mini_hash, norm_title, sig_tokens, titles_similar
 
 UA = "bibcite/0.1 (https://github.com/leonardo/bibcite; mailto:bibcite@gmail.com)"
 BROWSER_UA = (
@@ -195,6 +195,73 @@ def try_dblp(title: str, author_hint: str = "") -> Match | None:
                     bibtex=bibtex,
                     url=info.get("ee", "") or info.get("url", ""),
                 )
+    return None
+
+
+def _dblp_hit_authors(info: dict) -> list[str]:
+    authors = (info.get("authors") or {}).get("author") or []
+    if isinstance(authors, dict):
+        authors = [authors]
+    return [a.get("text", "") for a in authors if isinstance(a, dict)]
+
+
+def try_dblp_fuzzy(title: str, author_hint: str, year: str = "") -> Match | None:
+    """Title-drift fallback: camera-ready titles often differ from the arXiv
+    ones ("Information-Theoretic" -> "Information Theory"), and DBLP's
+    token-AND search then misses entirely. Query author + the most
+    distinctive title tokens instead, and accept token-Jaccard-similar
+    titles — guarded by author and year so different papers can't sneak in.
+    """
+    if not author_hint:
+        return None
+    tokens = sorted(sig_tokens(title), key=len, reverse=True)[:3]
+    if not tokens:
+        return None
+    q = " ".join([author_hint] + tokens)
+    with _client() as c:
+        r = c.get(
+            "https://dblp.org/search/publ/api",
+            params={"q": q, "format": "json", "h": 100},
+        )
+        if r.status_code == 429:
+            raise SourceUnavailable("DBLP rate-limited (429)")
+        r.raise_for_status()
+        hits = r.json().get("result", {}).get("hits", {}).get("hit", []) or []
+        hits.sort(key=lambda h: int(h.get("info", {}).get("year", 9999)))
+        for hit in hits:
+            info = hit.get("info", {})
+            hit_title = clean_title(html.unescape(info.get("title", "")))
+            if info.get("venue") == "CoRR" or not info.get("venue"):
+                continue
+            if not titles_similar(hit_title, title):
+                continue
+            if year and info.get("year"):
+                if abs(int(info["year"]) - int(year)) > 2:
+                    continue
+            hit_authors = mini_hash(" ".join(_dblp_hit_authors(info)))
+            if author_hint not in hit_authors:
+                continue
+            venue = info["venue"]
+            if isinstance(venue, list):
+                venue = venue[0]
+            bibtex = ""
+            if info.get("url"):
+                br = c.get(info["url"] + ".bib")
+                if br.status_code == 200:
+                    bibtex = br.text
+            _log(
+                f"[dblp-fuzzy] match with title drift: '{hit_title}' "
+                f"@ {venue} {info.get('year', '')}"
+            )
+            return Match(
+                source="dblp-fuzzy",
+                venue=str(venue),
+                title=hit_title,
+                year=str(info.get("year", "")),
+                doi=info.get("doi", ""),
+                bibtex=bibtex,
+                url=info.get("ee", "") or info.get("url", ""),
+            )
     return None
 
 
@@ -627,4 +694,19 @@ def find_published(
             _log(f"[{name}] disabled for the rest of this run: {e}")
         except Exception as e:  # network hiccup on one source must not kill the run
             _log(f"[{name}] error: {type(e).__name__}: {e}")
+
+    # Exact-title search missed everywhere. Before concluding "no published
+    # version", try the title-drift fallback — camera-ready titles frequently
+    # differ from the arXiv ones, which is precisely the upgrade scenario.
+    if author_hint and "dblp" not in _DISABLED:
+        try:
+            m = try_dblp_fuzzy(title, author_hint, year)
+            if m:
+                cache.put(cache_key, m.__dict__)
+                return m, "found"
+            clean_misses += 1
+        except SourceUnavailable as e:
+            _DISABLED["dblp"] = str(e)
+        except Exception as e:
+            _log(f"[dblp-fuzzy] error: {type(e).__name__}: {e}")
     return None, ("not_found" if clean_misses else "unavailable")

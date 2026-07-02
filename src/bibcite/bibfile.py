@@ -20,14 +20,16 @@ from .normalize import norm_title
 # \cite{} commands valid.
 TIDY_ARGS = [
     "--modify",
-    "--omit=pages,publisher,doi,timestamp,biburl,bibsource,abstract,month,series,volume,editor,note,date,number,address",
+    # volume/number/pages/doi are kept (bibliographic substance the user
+    # asked to retain); the omit list drops only true noise.
+    "--omit=publisher,timestamp,biburl,bibsource,abstract,month,series,editor,note,date,address",
     "--curly",
     "--blank-lines",
     "--trailing-commas",
     "--sort=-year",
     "--duplicates=citation",
     "--merge=first",
-    "--sort-fields=author,title,booktitle,journal,year,url,pdf",
+    "--sort-fields=author,title,booktitle,journal,volume,number,pages,year,doi,url,pdf",
     "--strip-enclosing-braces",
     "--tidy-comments",
 ]
@@ -143,32 +145,47 @@ def find_existing(db: BibDatabase, title: str, arxiv_id: str = "", doi: str = ""
     return None
 
 
-def upsert_entry(path: Path, entry: dict, replace: bool = False) -> tuple[str, str]:
+def upsert_entry(
+    path: Path, entry: dict, replace: bool = False, replace_key: str = ""
+) -> tuple[str, str]:
     """Insert or upgrade ``entry`` in ``path``.
 
     Returns (action, key), action in "added" | "upgraded" | "exists" |
-    "replaced". With ``replace``, an existing matching entry is overwritten
-    (its citation key is kept so existing \\cite{} commands stay valid).
+    "replaced" | "no_match_to_replace". With ``replace``, an existing
+    matching entry is overwritten; ``replace_key`` targets a specific entry
+    by citation key (for when title drift defeats the automatic match). The
+    existing key is always kept so \\cite{} commands stay valid. A replace
+    that matches nothing is an ERROR, not a silent add — that is how
+    duplicate entries sneak into a file.
     """
     db = load_bib_file(path)
     if db is None:  # unparseable file: append blindly
+        if replace or replace_key:
+            return "no_match_to_replace", replace_key or entry["ID"]
         with path.open("a") as f:
             f.write("\n" + entry_to_bibtex(entry))
         return "added", entry["ID"]
 
-    existing = find_existing(
-        db, entry.get("title", ""), entry_arxiv_id(entry), entry.get("doi", "")
-    )
+    if replace_key:
+        existing = next((e for e in db.entries if e.get("ID") == replace_key), None)
+    else:
+        existing = find_existing(
+            db, entry.get("title", ""), entry_arxiv_id(entry), entry.get("doi", "")
+        )
+
     if existing is not None:
         upgrade = is_preprint(existing) and not is_preprint(entry)
-        if replace or upgrade:
+        if replace or replace_key or upgrade:
             key = existing["ID"]
             existing.clear()
             existing.update({k: str(v) for k, v in entry.items() if v})
             existing["ID"] = key  # keep the key the user may already \cite
             _write_db(path, db)
-            return ("replaced" if replace else "upgraded"), key
+            return ("replaced" if (replace or replace_key) else "upgraded"), key
         return "exists", existing["ID"]
+
+    if replace or replace_key:
+        return "no_match_to_replace", replace_key or entry["ID"]
 
     db.entries.append({k: str(v) for k, v in entry.items() if v})
     _write_db(path, db)
@@ -190,6 +207,12 @@ def remove_entry(path: Path, key: str) -> bool:
 
 
 def _write_db(path: Path, db: BibDatabase):
+    # Never write our injected month macros back out as @string blocks (they
+    # exist only so parsing month=June doesn't crash); this also scrubs any
+    # that leaked into a file before this guard existed. User-defined
+    # @strings are untouched.
+    for k in MONTH_STRINGS:
+        db.strings.pop(k, None)
     writer = BibTexWriter()
     writer.indent = "  "
     writer.order_entries_by = None  # preserve file order; tidy re-sorts anyway

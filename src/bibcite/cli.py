@@ -12,7 +12,8 @@ import time
 from pathlib import Path
 
 from . import bibfile, cache
-from .normalize import first_author_last_name, norm_title
+from .normalize import first_author_last_name, norm_title, titles_similar
+from .resolve import classify
 from .resolve import (
     NotFound,
     Resolved,
@@ -107,50 +108,107 @@ def _resolve_user_bibtex(text: str) -> Resolved:
         entry.pop("journal", None)
         entry["ENTRYTYPE"] = canonical.entry_type
         entry[canonical.bib_field] = canonical.name
-    return Resolved(entry, "user-bibtex", canonical.name if canonical else raw_venue, True)
+    published = not bibfile.is_preprint(entry)
+    return Resolved(
+        entry,
+        "user-bibtex",
+        (canonical.name if canonical else raw_venue) if published else "",
+        published,
+    )
+
+
+def _local_exists(path: Path, query: str) -> str | None:
+    """Local pre-check: if the query is already in the file as a PUBLISHED
+    entry, skip the network entirely (makes --from re-runs and repeated adds
+    near-instant). Preprints still resolve online — they may be upgradable."""
+    db = bibfile.load_bib_file(path)
+    if db is None or not db.entries:
+        return None
+    kind, value = classify(query)
+    if kind == "arxiv":
+        existing = bibfile.find_existing(db, "", arxiv_id=value)
+    elif kind == "doi":
+        existing = bibfile.find_existing(db, "", doi=value)
+    else:
+        existing = bibfile.find_existing(db, value)
+    if existing is not None and not bibfile.is_preprint(existing):
+        return existing["ID"]
+    return None
 
 
 def cmd_add(args) -> int:
     path = Path(args.file)
     if args.no_cache:
         cache.DISABLED = True
+    targeting = args.replace or bool(args.key)
+    if args.key and args.from_file:
+        _log("[bibcite] --key targets one entry; it cannot be combined with --from")
+        return EXIT_NOT_FOUND
 
     # Collect the queries for this invocation (single, --bibtex, or --from).
+    # Each item: (query, resolved_or_None, exit_code, local_exists_key).
+    items: list[tuple[str, Resolved | None, int, str]] = []
     if args.bibtex:
         text = sys.stdin.read() if args.bibtex == "-" else args.bibtex
         try:
-            resolutions = [("<bibtex>", _resolve_user_bibtex(text), 0)]
+            items.append(("<bibtex>", _resolve_user_bibtex(text), 0, ""))
         except ValueError as e:
             _log(f"[bibcite] {e}")
             return EXIT_NOT_FOUND
     elif args.from_file:
         lines = Path(args.from_file).read_text().splitlines()
         queries = [q.strip() for q in lines if q.strip() and not q.strip().startswith("#")]
-        resolutions = []
+        resolved_any = False
         for i, q in enumerate(queries):
-            if i:
+            local = None if targeting else _local_exists(path, q)
+            if local:
+                _log(f"[bibcite] ({i + 1}/{len(queries)}) {q} — already in file: {local}")
+                items.append((q, None, 0, local))
+                continue
+            if resolved_any:
                 time.sleep(1)  # one process shares the rate-limit breaker; stay polite
+            resolved_any = True
             _log(f"[bibcite] ({i + 1}/{len(queries)}) {q}")
             res, code = _resolve_or_none(q, args.require_published)
-            resolutions.append((q, res, code))
+            items.append((q, res, code, ""))
     else:
         if not args.query:
             _log("[bibcite] provide a query (arXiv id / DOI / title), --bibtex, or --from")
             return EXIT_NOT_FOUND
         query = " ".join(args.query)
+        local = None if targeting else _local_exists(path, query)
+        if local:
+            _log(f"[bibcite] already in file (matched locally, no network): {local}")
+            _emit({"action": "exists", "key": local, "file": str(path), "tidied": False})
+            return 0
         res, code = _resolve_or_none(query, args.require_published)
         if res is None:
             return code
-        resolutions = [(query, res, 0)]
+        items.append((query, res, 0, ""))
 
     # Write all entries first, tidy once, then read back the final keys.
     results = []
     wrote = False
-    for query, res, code in resolutions:
+    for query, res, code, local_key in items:
+        if local_key:
+            results.append({"query": query, "action": "exists", "key": local_key})
+            continue
         if res is None:
             results.append({"query": query, "action": "failed", "exit_code": code})
             continue
-        action, key = bibfile.upsert_entry(path, res.entry, replace=args.replace)
+        action, key = bibfile.upsert_entry(
+            path, res.entry, replace=args.replace, replace_key=args.key or ""
+        )
+        if action == "no_match_to_replace":
+            # A replace that matches nothing must fail loudly, never silently
+            # add a duplicate entry.
+            _log(
+                f"[bibcite] no matching entry to replace for '{query}'"
+                + (f" (key: {args.key})" if args.key else "")
+                + " — nothing written. Use `bibcite add --key <existing-key>` to target one."
+            )
+            results.append({"query": query, "action": action, "exit_code": EXIT_NOT_FOUND})
+            continue
         wrote = wrote or action != "exists"
         results.append(
             {
@@ -246,6 +304,10 @@ def _upgrade_entries(path: Path, dry_run: bool) -> dict:
                 entry["year"] = match.year
             if match.doi and not entry.get("doi"):
                 entry["doi"] = match.doi
+            if match.title:
+                # Camera-ready titles drift from arXiv ones; the published
+                # title is the correct one to cite.
+                entry["title"] = match.title
             changed += 1
         report.append(
             {
@@ -294,11 +356,30 @@ def _check_problems(path: Path) -> tuple[int, list] | None:
         return None
     problems = []
     seen_titles: dict[str, str] = {}
+    by_author: dict[str, list[tuple[str, str]]] = {}  # lastname -> [(key, title)]
     for entry in db.entries:
         key = entry.get("ID", "?")
         nt = norm_title(entry.get("title", ""))
         if nt and nt in seen_titles:
             problems.append({"key": key, "issue": f"duplicate title of {seen_titles[nt]}"})
+        elif nt:
+            # Near-duplicates (title drift: same first author, similar title)
+            # slip past exact matching — exactly how a failed replace plus a
+            # re-add pollutes a file.
+            last = (
+                first_author_last_name(entry["author"]) if entry.get("author") else ""
+            )
+            for other_key, other_title in by_author.get(last, []):
+                if titles_similar(entry.get("title", ""), other_title):
+                    problems.append(
+                        {
+                            "key": key,
+                            "issue": f"near-duplicate of {other_key} (title drift?)",
+                        }
+                    )
+                    break
+            if last:
+                by_author.setdefault(last, []).append((key, entry.get("title", "")))
         seen_titles.setdefault(nt, key)
         for f in ("author", "title", "year"):
             if not entry.get(f):
@@ -388,7 +469,8 @@ def main(argv=None) -> int:
     a.add_argument("query", nargs="*", help="arXiv id / arXiv URL / DOI / title")
     a.add_argument("--bibtex", help="raw BibTeX entry to add instead of a query ('-' reads stdin)")
     a.add_argument("--from", dest="from_file", metavar="FILE", help="batch mode: one query per line (shares rate-limit state, tidies once)")
-    a.add_argument("--replace", action="store_true", help="overwrite an existing matching entry (keeps its citation key)")
+    a.add_argument("--replace", action="store_true", help="overwrite an existing matching entry (keeps its citation key); errors if nothing matches")
+    a.add_argument("--key", metavar="KEY", help="replace exactly the entry with this citation key (for title drift)")
     a.add_argument("--no-tidy", action="store_true")
     a.add_argument("--no-cache", action="store_true", help="bypass the local match cache")
     a.add_argument("--require-published", action="store_true")

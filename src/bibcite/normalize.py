@@ -76,6 +76,22 @@ def first_author_last_name(author_field: str) -> str:
     return mini_hash(last) or "anon"
 
 
+def sig_tokens(title: str) -> set[str]:
+    """Significant title tokens: folded, alphanumeric, stopwords removed."""
+    tokens = re.split(r"[^a-z0-9]+", fold_ascii(title).lower())
+    return {t for t in tokens if len(t) > 2 and t not in ENGLISH_STOPWORDS}
+
+
+def titles_similar(a: str, b: str, threshold: float = 0.7) -> bool:
+    """Token-Jaccard similarity — catches preprint→camera-ready title drift
+    ("Information-Theoretic Perspective" vs "Information Theory Perspective")
+    without matching genuinely different papers."""
+    ta, tb = sig_tokens(a), sig_tokens(b)
+    if not ta or not tb:
+        return False
+    return len(ta & tb) / len(ta | tb) >= threshold
+
+
 def fix_author_caps(author_field: str) -> str:
     """Normalize ALL-CAPS author names (old CrossRef records store e.g.
     "EPPS, T. W. and PULLEY, LAWRENCE B."). A word is re-cased only when it
