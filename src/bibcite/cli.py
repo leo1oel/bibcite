@@ -80,18 +80,18 @@ def cmd_get(args) -> int:
     res, code = _resolve_or_none(query, args.require_published)
     if res is None:
         return code
-    _emit(
-        {
-            "action": "resolved",
-            "key": res.entry["ID"],
-            "title": res.entry.get("title", ""),
-            "venue": res.venue or "arXiv (preprint, no published venue found)",
-            "published": res.published,
-            "source": res.source,
-            "bibtex": res.bibtex,
-        },
-        args.json,
-    )
+    payload = {
+        "action": "resolved",
+        "key": res.entry["ID"],
+        "title": res.entry.get("title", ""),
+        "venue": res.venue or "arXiv (preprint, no published venue found)",
+        "published": res.published,
+        "source": res.source,
+        "bibtex": res.bibtex,
+    }
+    if not res.published:
+        payload["published_check"] = res.check
+    _emit(payload, args.json)
     return 0
 
 
@@ -256,6 +256,10 @@ def cmd_add(args) -> int:
             "published": res.published,
             "source": res.source,
         }
+        if not res.published:
+            # "incomplete" = the check ran while core sources were down; the
+            # paper may well be published — retry later.
+            result["published_check"] = res.check
         if warning:
             result["warning"] = warning
         results.append(result)
@@ -312,10 +316,13 @@ def _upgrade_entries(path: Path, dry_run: bool) -> dict:
         )
         match, status = find_published(title, entry.get("year", ""), aid, hint)
         if not match:
-            # "no_published_version" is a trustworthy miss; "sources_unavailable"
-            # means the sources were down — do not conclude anything.
+            # "no_published_version" is trustworthy ONLY when every core
+            # source answered; a batch that tripped DBLP's rate limit gets
+            # "sources_unavailable" so nobody believes a poisoned verdict.
             reason = (
-                "sources_unavailable" if status == "unavailable" else "no_published_version"
+                "no_published_version"
+                if status == "not_found"
+                else "sources_unavailable"
             )
             report.append(
                 {"key": entry["ID"], "title": title, "matched": False, "reason": reason}

@@ -147,6 +147,42 @@ def arxiv_metadata(arxiv_id: str) -> ArxivMeta:
 # DBLP
 # ---------------------------------------------------------------------------
 
+# DBLP throttles at roughly 1-2 req/s and escalates to temporary IP bans when
+# hammered. Client-side pacing prevents the 429 in the first place; on a 429
+# we back off and retry (honoring Retry-After) instead of instantly poisoning
+# the rest of a batch run — only repeated failure disables the source.
+_DBLP_MIN_INTERVAL = 0.8
+_dblp_last_request = 0.0
+
+
+def _dblp_get(c: httpx.Client, url: str, params: dict | None = None) -> httpx.Response:
+    global _dblp_last_request
+    for attempt in range(3):
+        wait = _DBLP_MIN_INTERVAL - (time.monotonic() - _dblp_last_request)
+        if wait > 0:
+            time.sleep(wait)
+        _dblp_last_request = time.monotonic()
+        try:
+            r = c.get(url, params=params)
+        except httpx.HTTPError as e:  # TCP reset = temporary ban; retrying fast makes it worse
+            if attempt < 2:
+                time.sleep(5 * (attempt + 1))
+                continue
+            raise SourceUnavailable(f"DBLP unreachable ({type(e).__name__})")
+        if r.status_code == 429:
+            retry_after = int(r.headers.get("Retry-After") or 0)
+            if retry_after > 30:
+                raise SourceUnavailable(f"DBLP rate-limited (Retry-After {retry_after}s)")
+            if attempt < 2:
+                delay = max(retry_after, 4 * (attempt + 1))
+                _log(f"[dblp] 429 — backing off {delay}s")
+                time.sleep(delay)
+                continue
+            raise SourceUnavailable("DBLP rate-limited (429) after backoff retries")
+        return r
+    raise SourceUnavailable("DBLP unavailable")
+
+
 def try_dblp(title: str, author_hint: str = "") -> Match | None:
     """DBLP search. Generic titles ("X is all you need") drown in DBLP's
     ranking, so when we know the first author we query with their last name
@@ -157,12 +193,11 @@ def try_dblp(title: str, author_hint: str = "") -> Match | None:
     queries.append(title)
     with _client() as c:
         for q in queries:
-            r = c.get(
+            r = _dblp_get(
+                c,
                 "https://dblp.org/search/publ/api",
                 params={"q": q, "format": "json", "h": 100},
             )
-            if r.status_code == 429:
-                raise SourceUnavailable("DBLP rate-limited (429)")
             r.raise_for_status()
             hits = (
                 r.json().get("result", {}).get("hits", {}).get("hit", []) or []
@@ -182,9 +217,12 @@ def try_dblp(title: str, author_hint: str = "") -> Match | None:
                     venue = venue[0]
                 bibtex = ""
                 if info.get("url"):
-                    br = c.get(info["url"] + ".bib")
-                    if br.status_code == 200:
-                        bibtex = br.text
+                    try:
+                        br = _dblp_get(c, info["url"] + ".bib")
+                        if br.status_code == 200:
+                            bibtex = br.text
+                    except SourceUnavailable:
+                        pass  # keep the match; construct from fields
                 _log(f"[dblp] match: {venue} {info.get('year', '')}")
                 return Match(
                     source="dblp",
@@ -219,12 +257,11 @@ def try_dblp_fuzzy(title: str, author_hint: str, year: str = "") -> Match | None
         return None
     q = " ".join([author_hint] + tokens)
     with _client() as c:
-        r = c.get(
+        r = _dblp_get(
+            c,
             "https://dblp.org/search/publ/api",
             params={"q": q, "format": "json", "h": 100},
         )
-        if r.status_code == 429:
-            raise SourceUnavailable("DBLP rate-limited (429)")
         r.raise_for_status()
         hits = r.json().get("result", {}).get("hits", {}).get("hit", []) or []
         hits.sort(key=lambda h: int(h.get("info", {}).get("year", 9999)))
@@ -246,9 +283,12 @@ def try_dblp_fuzzy(title: str, author_hint: str, year: str = "") -> Match | None
                 venue = venue[0]
             bibtex = ""
             if info.get("url"):
-                br = c.get(info["url"] + ".bib")
-                if br.status_code == 200:
-                    bibtex = br.text
+                try:
+                    br = _dblp_get(c, info["url"] + ".bib")
+                    if br.status_code == 200:
+                        bibtex = br.text
+                except SourceUnavailable:
+                    pass  # keep the match; construct from fields
             _log(
                 f"[dblp-fuzzy] match with title drift: '{hit_title}' "
                 f"@ {venue} {info.get('year', '')}"
@@ -659,16 +699,24 @@ CASCADE = (
 # (PaperMemory's DISABLE_MATCH, ported).
 _DISABLED: dict[str, str] = {}
 
+# Only these sources are authoritative enough that losing one taints a miss
+# into "incomplete". Google Scholar captchas and Unpaywall flakiness are
+# routine and must not stop "not_found" from ever being trustworthy.
+CORE_SOURCES = frozenset({"dblp", "semanticscholar", "crossref", "openalex"})
+
 
 def find_published(
     title: str, year: str = "", arxiv_id: str = "", author_hint: str = ""
 ) -> tuple[Match | None, str]:
     """Try each source in order; first verified hit wins.
 
-    Returns (match, status). status distinguishes a trustworthy miss from an
-    outage: "found" | "not_found" (>=1 source answered cleanly with no hit) |
-    "unavailable" (every source was disabled or errored — do NOT conclude the
-    paper is unpublished).
+    Returns (match, status):
+      "found"       — verified publication match
+      "not_found"   — EVERY source answered cleanly with no hit; trustworthy
+      "incomplete"  — some sources answered (no hit) but others were
+                      disabled/erroring; a batch run that tripped DBLP's rate
+                      limit lands here — do NOT conclude "unpublished"
+      "unavailable" — no source answered at all
     """
     from . import cache
 
@@ -679,6 +727,8 @@ def find_published(
         return Match(**cached), "found"
 
     clean_misses = 0
+    # Core sources lost earlier in this run taint this query's verdict too.
+    incomplete = any(n in CORE_SOURCES for n in _DISABLED)
     for name, fn in CASCADE:
         if name in _DISABLED:
             continue
@@ -691,8 +741,10 @@ def find_published(
             _log(f"[{name}] no publication found")
         except SourceUnavailable as e:
             _DISABLED[name] = str(e)
+            incomplete = incomplete or name in CORE_SOURCES
             _log(f"[{name}] disabled for the rest of this run: {e}")
         except Exception as e:  # network hiccup on one source must not kill the run
+            incomplete = incomplete or name in CORE_SOURCES
             _log(f"[{name}] error: {type(e).__name__}: {e}")
 
     # Exact-title search missed everywhere. Before concluding "no published
@@ -707,6 +759,10 @@ def find_published(
             clean_misses += 1
         except SourceUnavailable as e:
             _DISABLED["dblp"] = str(e)
+            incomplete = True
         except Exception as e:
+            incomplete = True
             _log(f"[dblp-fuzzy] error: {type(e).__name__}: {e}")
-    return None, ("not_found" if clean_misses else "unavailable")
+    if not clean_misses:
+        return None, "unavailable"
+    return None, ("incomplete" if incomplete else "not_found")

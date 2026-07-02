@@ -72,6 +72,12 @@ class Resolved:
     source: str  # where the publication info came from
     venue: str  # final venue string ("" if preprint)
     published: bool
+    # For preprint fallbacks: was the publication check trustworthy?
+    # "complete"   — every core source answered; the paper really has no
+    #                published version (as of now)
+    # "incomplete" — core sources were rate-limited/down; retry later before
+    #                believing the preprint status
+    check: str = "complete"
 
     @property
     def bibtex(self) -> str:
@@ -220,9 +226,16 @@ def resolve(query: str, require_published: bool = False) -> Resolved:
                     f"Could not check publication status for arXiv:{value} (sources down)"
                 )
             raise NotFound(f"No published version found for arXiv:{value}")
-        _log("[bibcite] no published version found; using arXiv preprint entry")
+        check = "complete" if status == "not_found" else "incomplete"
+        if check == "incomplete":
+            _log(
+                "[bibcite] preprint fallback with INCOMPLETE publication check "
+                "(core sources were unavailable) — retry later"
+            )
+        else:
+            _log("[bibcite] no published version found; using arXiv preprint entry")
         entry = _arxiv_only_entry(meta)
-        return Resolved(_finalize(entry, meta), "arxiv", "", False)
+        return Resolved(_finalize(entry, meta), "arxiv", "", False, check)
 
     if kind == "doi":
         match = crossref_by_doi(value)
@@ -256,9 +269,16 @@ def resolve(query: str, require_published: bool = False) -> Resolved:
     if meta and meta.arxiv_id:
         if require_published:
             raise NotFound(f"Only an arXiv preprint was found for: {value}")
-        _log("[bibcite] no published version found; using arXiv preprint entry")
+        check = "complete" if status == "not_found" else "incomplete"
+        if check == "incomplete":
+            _log(
+                "[bibcite] preprint fallback with INCOMPLETE publication check "
+                "(core sources were unavailable) — retry later"
+            )
+        else:
+            _log("[bibcite] no published version found; using arXiv preprint entry")
         entry = _arxiv_only_entry(meta)
-        return Resolved(_finalize(entry, meta), "arxiv", "", False)
+        return Resolved(_finalize(entry, meta), "arxiv", "", False, check)
     if status == "unavailable":
         raise SourcesUnavailable(
             f"All sources were rate-limited or down while resolving: {value}"
