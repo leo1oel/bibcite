@@ -82,14 +82,22 @@ def sig_tokens(title: str) -> set[str]:
     return {t for t in tokens if len(t) > 2 and t not in ENGLISH_STOPWORDS}
 
 
-def titles_similar(a: str, b: str, threshold: float = 0.7) -> bool:
-    """Token-Jaccard similarity — catches preprint→camera-ready title drift
+def titles_similar(a: str, b: str, threshold: float = 0.75) -> bool:
+    """Token-overlap similarity — catches preprint→camera-ready title drift
     ("Information-Theoretic Perspective" vs "Information Theory Perspective")
-    without matching genuinely different papers."""
+    without matching genuinely different papers.
+
+    Uses the overlap coefficient (|∩| / min) rather than Jaccard so one
+    changed word in a shortish title still matches; very short titles
+    (<=3 significant tokens, e.g. "Deep Learning") must match exactly
+    because a single shared word would otherwise dominate."""
     ta, tb = sig_tokens(a), sig_tokens(b)
     if not ta or not tb:
         return False
-    return len(ta & tb) / len(ta | tb) >= threshold
+    smaller = min(len(ta), len(tb))
+    if smaller <= 3:
+        return ta == tb
+    return len(ta & tb) / smaller >= threshold
 
 
 def fix_author_caps(author_field: str) -> str:
@@ -112,6 +120,12 @@ def fix_author_caps(author_field: str) -> str:
 
     names = re.split(r"\s+and\s+", author_field)
     return " and ".join(fix_name(n) for n in names)
+
+
+def fix_pages(pages: str) -> str:
+    """BibTeX page ranges use `--`; CrossRef emits en-dashes (411–430) and
+    some sources a single hyphen. Collapse any dash run to `--`."""
+    return re.sub(r"\s*[-‐-―]+\s*", "--", pages.strip())
 
 
 def make_key(author_field: str, year: str | int, title: str) -> str:

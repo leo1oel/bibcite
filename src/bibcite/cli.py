@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 
 from . import bibfile, cache
-from .normalize import first_author_last_name, norm_title, titles_similar
+from .normalize import first_author_last_name, fix_pages, norm_title, titles_similar
 from .resolve import classify
 from .resolve import (
     NotFound,
@@ -108,12 +108,39 @@ def _resolve_user_bibtex(text: str) -> Resolved:
         entry.pop("journal", None)
         entry["ENTRYTYPE"] = canonical.entry_type
         entry[canonical.bib_field] = canonical.name
+    if entry.get("pages"):
+        entry["pages"] = fix_pages(entry["pages"])
     published = not bibfile.is_preprint(entry)
     return Resolved(
         entry,
         "user-bibtex",
         (canonical.name if canonical else raw_venue) if published else "",
         published,
+    )
+
+
+def _identity_mismatch(path: Path, target_key: str, new_entry: dict) -> str:
+    """`--key` is a scalpel — warn when the resolved paper does not look like
+    the entry it is about to overwrite (no shared arXiv id, DOI, or similar
+    title), because the old key would then be citing a different paper."""
+    db = bibfile.load_bib_file(path)
+    if db is None:
+        return ""
+    target = next((e for e in db.entries if e.get("ID") == target_key), None)
+    if target is None:
+        return ""
+    old_aid, new_aid = bibfile.entry_arxiv_id(target), bibfile.entry_arxiv_id(new_entry)
+    if old_aid and new_aid and old_aid == new_aid:
+        return ""
+    old_doi, new_doi = target.get("doi", "").lower(), new_entry.get("doi", "").lower()
+    if old_doi and new_doi and old_doi == new_doi:
+        return ""
+    if titles_similar(target.get("title", ""), new_entry.get("title", "")):
+        return ""
+    return (
+        f"replacing '{target_key}' with what looks like a DIFFERENT paper "
+        f"('{target.get('title', '')[:50]}' -> '{new_entry.get('title', '')[:50]}'); "
+        "the key will no longer describe its contents"
     )
 
 
@@ -131,7 +158,12 @@ def _local_exists(path: Path, query: str) -> str | None:
         existing = bibfile.find_existing(db, "", doi=value)
     else:
         existing = bibfile.find_existing(db, value)
-    if existing is not None and not bibfile.is_preprint(existing):
+    if existing is None:
+        return None
+    if not bibfile.is_preprint(existing):
+        return existing["ID"]
+    if existing.get("pubstate", "").strip("{}") == "preprint":
+        # Confirmed preprint-only: nothing to upgrade, no reason to go online.
         return existing["ID"]
     return None
 
@@ -196,6 +228,11 @@ def cmd_add(args) -> int:
         if res is None:
             results.append({"query": query, "action": "failed", "exit_code": code})
             continue
+        warning = ""
+        if args.key:
+            warning = _identity_mismatch(path, args.key, res.entry)
+            if warning:
+                _log(f"[bibcite] warning: {warning}")
         action, key = bibfile.upsert_entry(
             path, res.entry, replace=args.replace, replace_key=args.key or ""
         )
@@ -210,17 +247,18 @@ def cmd_add(args) -> int:
             results.append({"query": query, "action": action, "exit_code": EXIT_NOT_FOUND})
             continue
         wrote = wrote or action != "exists"
-        results.append(
-            {
-                "query": query,
-                "action": action,
-                "key": key,
-                "title": res.entry.get("title", ""),
-                "venue": res.venue or "arXiv (preprint)",
-                "published": res.published,
-                "source": res.source,
-            }
-        )
+        result = {
+            "query": query,
+            "action": action,
+            "key": key,
+            "title": res.entry.get("title", ""),
+            "venue": res.venue or "arXiv (preprint)",
+            "published": res.published,
+            "source": res.source,
+        }
+        if warning:
+            result["warning"] = warning
+        results.append(result)
 
     tidied = False
     if wrote and not args.no_tidy:

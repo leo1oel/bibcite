@@ -10,7 +10,13 @@ import sys
 from dataclasses import dataclass
 
 from .bibfile import NOISE_FIELDS, parse_bibtex_entry
-from .normalize import clean_title, first_author_last_name, fix_author_caps, make_key
+from .normalize import (
+    clean_title,
+    first_author_last_name,
+    fix_author_caps,
+    fix_pages,
+    make_key,
+)
 
 
 class NotFound(Exception):
@@ -153,6 +159,8 @@ def _finalize(entry: dict, meta: ArxivMeta | None) -> dict:
         # a missing url from the DOI.
         if not url or "dx.doi.org" in url:
             entry["url"] = f"https://doi.org/{entry['doi']}"
+    if entry.get("pages"):
+        entry["pages"] = fix_pages(entry["pages"])
     author = entry.get("author", "") or "anonymous"
     year = entry.get("year", "") or "XXXX"
     entry["ID"] = make_key(author, year, entry.get("title", ""))

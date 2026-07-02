@@ -133,15 +133,37 @@ def load_bib_file(path: Path) -> BibDatabase | None:
         return None
 
 
-def find_existing(db: BibDatabase, title: str, arxiv_id: str = "", doi: str = "") -> dict | None:
+def find_existing(
+    db: BibDatabase,
+    title: str,
+    arxiv_id: str = "",
+    doi: str = "",
+    author: str = "",
+) -> dict | None:
+    from .normalize import first_author_last_name, titles_similar
+
     ref = norm_title(title)
     for entry in db.entries:
         if arxiv_id and entry_arxiv_id(entry) == arxiv_id:
             return entry
-        if doi and entry.get("doi", "").lower() == doi.lower():
-            return entry
+        if doi:
+            d = doi.lower()
+            # Older entries may lack a doi field but carry it in the url.
+            if entry.get("doi", "").lower() == d or d in entry.get("url", "").lower():
+                return entry
         if ref and norm_title(entry.get("title", "")) == ref:
             return entry
+    # Fuzzy pass: title drift (arXiv vs camera-ready) with the same first
+    # author is the same paper — catch it BEFORE writing a duplicate pair.
+    if title and author:
+        last = first_author_last_name(author)
+        for entry in db.entries:
+            if not entry.get("author"):
+                continue
+            if first_author_last_name(entry["author"]) != last:
+                continue
+            if titles_similar(title, entry.get("title", "")):
+                return entry
     return None
 
 
@@ -170,7 +192,11 @@ def upsert_entry(
         existing = next((e for e in db.entries if e.get("ID") == replace_key), None)
     else:
         existing = find_existing(
-            db, entry.get("title", ""), entry_arxiv_id(entry), entry.get("doi", "")
+            db,
+            entry.get("title", ""),
+            entry_arxiv_id(entry),
+            entry.get("doi", ""),
+            entry.get("author", ""),
         )
 
     if existing is not None:
@@ -232,7 +258,28 @@ def tidy_command() -> list[str] | None:
     return None
 
 
+_MONTH_STRING_BLOCK = re.compile(
+    r"@string\s*\{\s*(?:" + "|".join(MONTH_STRINGS) + r")\s*=",
+    re.IGNORECASE,
+)
+
+
+def _scrub_month_strings(path: Path):
+    """Remove orphan month @string blocks left by the pre-0.4 leak.
+    bibtex-tidy itself preserves @strings, so tidy alone never cleans them."""
+    try:
+        if not _MONTH_STRING_BLOCK.search(path.read_text()):
+            return
+        db = load_bib_file(path)
+        if db is not None:
+            _write_db(path, db)  # _write_db drops the injected month macros
+            _log("[bibcite] scrubbed leftover month @string blocks")
+    except Exception as e:
+        _log(f"[bibcite] month-string scrub skipped: {e}")
+
+
 def run_tidy(path: Path) -> bool:
+    _scrub_month_strings(path)
     cmd = tidy_command()
     if cmd is None:
         _log("[bibcite] bibtex-tidy not found (npm i -g bibtex-tidy); skipping tidy")
