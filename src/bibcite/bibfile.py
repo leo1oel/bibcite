@@ -20,7 +20,7 @@ from .normalize import norm_title
 # \cite{} commands valid.
 TIDY_ARGS = [
     "--modify",
-    "--omit=pages,publisher,doi,timestamp,biburl,bibsource,abstract,month,series,volume,editor,note,date,number,address",
+    "--omit=pages,publisher,doi,timestamp,biburl,bibsource,abstract,month,series,volume,editor,note,date,number,address,issn,isbn",
     "--curly",
     "--blank-lines",
     "--trailing-commas",
