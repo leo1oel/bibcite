@@ -76,6 +76,28 @@ def first_author_last_name(author_field: str) -> str:
     return mini_hash(last) or "anon"
 
 
+def fix_author_caps(author_field: str) -> str:
+    """Normalize ALL-CAPS author names (old CrossRef records store e.g.
+    "EPPS, T. W. and PULLEY, LAWRENCE B."). A word is re-cased only when it
+    is fully uppercase and longer than 2 letters, so initials ("T.", "W.")
+    and legitimately-capitalized short names survive."""
+
+    def fix_word(w: str) -> str:
+        core = re.sub(r"[^A-Za-z]", "", w)
+        if len(core) > 2 and core.isupper():
+            return w.capitalize()
+        return w
+
+    def fix_name(name: str) -> str:
+        letters = re.sub(r"[^A-Za-z]", "", name)
+        if not letters.isupper():
+            return name  # mixed case already — leave it alone
+        return " ".join(fix_word(w) for w in name.split())
+
+    names = re.split(r"\s+and\s+", author_field)
+    return " and ".join(fix_name(n) for n in names)
+
+
 def make_key(author_field: str, year: str | int, title: str) -> str:
     """Deterministic citation key: <lastname><year><firstword>.
 

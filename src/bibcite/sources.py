@@ -595,19 +595,36 @@ _DISABLED: dict[str, str] = {}
 
 def find_published(
     title: str, year: str = "", arxiv_id: str = "", author_hint: str = ""
-) -> Match | None:
-    """Try each source in order; first verified hit wins."""
+) -> tuple[Match | None, str]:
+    """Try each source in order; first verified hit wins.
+
+    Returns (match, status). status distinguishes a trustworthy miss from an
+    outage: "found" | "not_found" (>=1 source answered cleanly with no hit) |
+    "unavailable" (every source was disabled or errored — do NOT conclude the
+    paper is unpublished).
+    """
+    from . import cache
+
+    cache_key = norm_title(title)
+    cached = cache.get(cache_key)
+    if cached:
+        _log(f"[cache] hit: {cached.get('venue', '')} ({cached.get('source', '')})")
+        return Match(**cached), "found"
+
+    clean_misses = 0
     for name, fn in CASCADE:
         if name in _DISABLED:
             continue
         try:
             m = fn(title, year, arxiv_id, author_hint)
             if m:
-                return m
+                cache.put(cache_key, m.__dict__)
+                return m, "found"
+            clean_misses += 1
             _log(f"[{name}] no publication found")
         except SourceUnavailable as e:
             _DISABLED[name] = str(e)
             _log(f"[{name}] disabled for the rest of this run: {e}")
         except Exception as e:  # network hiccup on one source must not kill the run
             _log(f"[{name}] error: {type(e).__name__}: {e}")
-    return None
+    return None, ("not_found" if clean_misses else "unavailable")

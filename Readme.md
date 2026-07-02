@@ -45,6 +45,13 @@ bibcite add refs.bib 2103.14030 --json
 # Add a raw BibTeX entry you already have (venue still canonicalized, file still tidied)
 bibcite add refs.bib --bibtex "$(pbpaste)"
 
+# Batch add (one query per line; shares rate-limit state, tidies once)
+bibcite add refs.bib --from ids.txt
+
+# Overwrite a bad existing entry (keeps its key), or delete one
+bibcite add refs.bib <query> --replace
+bibcite remove refs.bib <key>
+
 # One-shot cleanup: upgrade preprints → tidy → lint
 bibcite fix refs.bib
 
@@ -56,8 +63,11 @@ bibcite tidy refs.bib
 bibcite check refs.bib
 ```
 
-`--json` prints a machine-readable result on stdout (`action`, `key`, `venue`, `source`, ...); all diagnostics go to stderr.
+`add`/`upgrade`/`check`/`fix`/`remove` print a machine-readable JSON result on stdout (`action`, `key`, `venue`, `source`, ...); all diagnostics go to stderr.
 `add` is idempotent: an existing entry returns `action: exists` with its key, and an existing arXiv entry matched to a published version is upgraded in place, keeping its citation key.
+Exit codes: 0 success, 2 paper not found (ask for a better identifier), 3 sources/tool failure (retry later).
+Successful matches are cached at `~/.cache/bibcite/published.json` (published papers only — preprint status is never cached); bypass with `--no-cache` or `BIBCITE_NO_CACHE=1`.
+Entries marked `pubstate = {preprint}` are treated as confirmed preprint-only and muted from `check`/`upgrade`.
 
 ## For agents
 

@@ -1,6 +1,6 @@
 [project]
 name = "bibcite-cli"
-version = "0.2.0"
+version = "0.3.0"
 description = "Resolve papers (arXiv id / DOI / title) to canonical, normalized BibTeX for agents and humans"
 readme = "Readme.md"
 license = "MIT"

@@ -11,11 +11,24 @@ import sys
 import time
 from pathlib import Path
 
-from . import bibfile
+from . import bibfile, cache
 from .normalize import first_author_last_name, norm_title
-from .resolve import Resolved, guess_entry_type, resolve
+from .resolve import (
+    NotFound,
+    Resolved,
+    SourcesUnavailable,
+    guess_entry_type,
+    resolve,
+)
 from .sources import find_published
 from .venues import canonicalize
+
+# Exit codes (part of the agent-facing contract):
+#   0 success
+#   2 the paper could not be resolved — ask for a stronger identifier
+#   3 internal/network failure (sources down, unexpected error) — retry later
+EXIT_NOT_FOUND = 2
+EXIT_INTERNAL = 3
 
 
 def _log(msg: str):
@@ -42,21 +55,30 @@ def _emit(payload: dict, as_json: bool = True):
 # get
 # ---------------------------------------------------------------------------
 
-def _resolve_or_none(query: str, require_published: bool):
+def _resolve_or_none(query: str, require_published: bool) -> tuple[Resolved | None, int]:
+    """(result, exit_code). Distinguishes 'not found' (2) from 'tool/source
+    failure' (3) so agents know whether to retry with a better identifier or
+    just retry later."""
     try:
-        return resolve(query, require_published=require_published)
-    except (LookupError, ValueError) as e:
+        return resolve(query, require_published=require_published), 0
+    except (NotFound, ValueError) as e:
         _log(f"[bibcite] {e}")
+        return None, EXIT_NOT_FOUND
+    except SourcesUnavailable as e:
+        _log(f"[bibcite] sources unavailable: {e}")
+        return None, EXIT_INTERNAL
     except Exception as e:
-        _log(f"[bibcite] network error: {type(e).__name__}: {e}")
-    return None
+        _log(f"[bibcite] internal error: {type(e).__name__}: {e}")
+        return None, EXIT_INTERNAL
 
 
 def cmd_get(args) -> int:
     query = " ".join(args.query)
-    res = _resolve_or_none(query, args.require_published)
+    if args.no_cache:
+        cache.DISABLED = True
+    res, code = _resolve_or_none(query, args.require_published)
     if res is None:
-        return 2
+        return code
     _emit(
         {
             "action": "resolved",
@@ -76,48 +98,86 @@ def cmd_get(args) -> int:
 # add
 # ---------------------------------------------------------------------------
 
+def _resolve_user_bibtex(text: str) -> Resolved:
+    entry = bibfile.parse_bibtex_entry(text)
+    raw_venue = entry.get("booktitle", "") or entry.get("journal", "")
+    canonical = canonicalize(raw_venue, entry.get("year"))
+    if canonical:
+        entry.pop("booktitle", None)
+        entry.pop("journal", None)
+        entry["ENTRYTYPE"] = canonical.entry_type
+        entry[canonical.bib_field] = canonical.name
+    return Resolved(entry, "user-bibtex", canonical.name if canonical else raw_venue, True)
+
+
 def cmd_add(args) -> int:
     path = Path(args.file)
+    if args.no_cache:
+        cache.DISABLED = True
+
+    # Collect the queries for this invocation (single, --bibtex, or --from).
     if args.bibtex:
         text = sys.stdin.read() if args.bibtex == "-" else args.bibtex
-        entry = bibfile.parse_bibtex_entry(text)
-        raw_venue = entry.get("booktitle", "") or entry.get("journal", "")
-        canonical = canonicalize(raw_venue, entry.get("year"))
-        if canonical:
-            entry.pop("booktitle", None)
-            entry.pop("journal", None)
-            entry["ENTRYTYPE"] = canonical.entry_type
-            entry[canonical.bib_field] = canonical.name
-        res = Resolved(entry, "user-bibtex", canonical.name if canonical else raw_venue, True)
+        try:
+            resolutions = [("<bibtex>", _resolve_user_bibtex(text), 0)]
+        except ValueError as e:
+            _log(f"[bibcite] {e}")
+            return EXIT_NOT_FOUND
+    elif args.from_file:
+        lines = Path(args.from_file).read_text().splitlines()
+        queries = [q.strip() for q in lines if q.strip() and not q.strip().startswith("#")]
+        resolutions = []
+        for i, q in enumerate(queries):
+            if i:
+                time.sleep(1)  # one process shares the rate-limit breaker; stay polite
+            _log(f"[bibcite] ({i + 1}/{len(queries)}) {q}")
+            res, code = _resolve_or_none(q, args.require_published)
+            resolutions.append((q, res, code))
     else:
         if not args.query:
-            _log("[bibcite] provide a query (arXiv id / DOI / title) or --bibtex")
-            return 2
+            _log("[bibcite] provide a query (arXiv id / DOI / title), --bibtex, or --from")
+            return EXIT_NOT_FOUND
         query = " ".join(args.query)
-        res = _resolve_or_none(query, args.require_published)
+        res, code = _resolve_or_none(query, args.require_published)
         if res is None:
-            return 2
+            return code
+        resolutions = [(query, res, 0)]
 
-    action, key = bibfile.upsert_entry(path, res.entry)
+    # Write all entries first, tidy once, then read back the final keys.
+    results = []
+    wrote = False
+    for query, res, code in resolutions:
+        if res is None:
+            results.append({"query": query, "action": "failed", "exit_code": code})
+            continue
+        action, key = bibfile.upsert_entry(path, res.entry, replace=args.replace)
+        wrote = wrote or action != "exists"
+        results.append(
+            {
+                "query": query,
+                "action": action,
+                "key": key,
+                "title": res.entry.get("title", ""),
+                "venue": res.venue or "arXiv (preprint)",
+                "published": res.published,
+                "source": res.source,
+            }
+        )
+
     tidied = False
-    if action != "exists" and not args.no_tidy:
+    if wrote and not args.no_tidy:
         tidied = bibfile.run_tidy(path)
         if tidied:
-            key = bibfile.key_after_tidy(path, res.entry.get("title", ""), key)
+            for r in results:
+                if r.get("title"):
+                    r["key"] = bibfile.key_after_tidy(path, r["title"], r["key"])
 
-    _emit(
-        {
-            "action": action,
-            "key": key,
-            "title": res.entry.get("title", ""),
-            "venue": res.venue or "arXiv (preprint)",
-            "published": res.published,
-            "source": res.source,
-            "file": str(path),
-            "tidied": tidied,
-        }
-    )
-    return 0
+    exit_code = max((r.get("exit_code", 0) for r in results), default=0)
+    if len(results) == 1 and not args.from_file:
+        _emit({**results[0], "file": str(path), "tidied": tidied})
+    else:
+        _emit({"file": str(path), "tidied": tidied, "results": results})
+    return exit_code
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +199,10 @@ def _upgrade_entries(path: Path, dry_run: bool) -> dict:
     for entry in db.entries:
         if not bibfile.is_preprint(entry):
             continue
+        if entry.get("pubstate", "").strip("{}") == "preprint":
+            # User-confirmed preprint-only (e.g. never-to-be-published arXiv
+            # reports): muted from upgrade and check.
+            continue
         title = entry.get("title", "").replace("{", "").replace("}", "")
         if not title:
             continue
@@ -150,9 +214,16 @@ def _upgrade_entries(path: Path, dry_run: bool) -> dict:
         hint = (
             first_author_last_name(entry["author"]) if entry.get("author") else ""
         )
-        match = find_published(title, entry.get("year", ""), aid, hint)
+        match, status = find_published(title, entry.get("year", ""), aid, hint)
         if not match:
-            report.append({"key": entry["ID"], "title": title, "matched": False})
+            # "no_published_version" is a trustworthy miss; "sources_unavailable"
+            # means the sources were down — do not conclude anything.
+            reason = (
+                "sources_unavailable" if status == "unavailable" else "no_published_version"
+            )
+            report.append(
+                {"key": entry["ID"], "title": title, "matched": False, "reason": reason}
+            )
             continue
         canonical = canonicalize(match.venue, match.year or entry.get("year"))
         venue_name = canonical.name if canonical else match.venue
@@ -192,13 +263,15 @@ def _upgrade_entries(path: Path, dry_run: bool) -> dict:
     matched = sum(1 for r in report if r["matched"])
     for r in report:
         mark = "✓" if r["matched"] else "✗"
-        _log(f"{mark} {r['key']}: {r.get('venue', 'no match')}")
+        _log(f"{mark} {r['key']}: {r.get('venue') or r.get('reason', 'no match')}")
     _log(f"[bibcite] {matched} matched, {changed} upgraded{' (dry-run)' if dry_run else ''}")
     return {"upgraded": changed, "matched": matched, "entries": report}
 
 
 def cmd_upgrade(args) -> int:
     path = Path(args.file)
+    if args.no_cache:
+        cache.DISABLED = True
     result = _upgrade_entries(path, args.dry_run)
     if result["upgraded"] and not args.no_tidy:
         bibfile.run_tidy(path)
@@ -230,8 +303,12 @@ def _check_problems(path: Path) -> tuple[int, list] | None:
         for f in ("author", "title", "year"):
             if not entry.get(f):
                 problems.append({"key": key, "issue": f"missing {f}"})
-        if bibfile.is_preprint(entry):
-            problems.append({"key": key, "issue": "arXiv preprint (try `bibcite upgrade`)"})
+        if bibfile.is_preprint(entry) and entry.get("pubstate", "").strip("{}") != "preprint":
+            problems.append({"key": key, "issue": "arXiv preprint (try `bibcite upgrade`, or set pubstate = {preprint} to mute)"})
+        author = entry.get("author", "")
+        letters = "".join(c for c in author if c.isalpha())
+        if letters and letters.isupper():
+            problems.append({"key": key, "issue": "author names are ALL CAPS"})
     for p in problems:
         _log(f"{p['key']}: {p['issue']}")
     _log(f"[bibcite] {len(db.entries)} entries, {len(problems)} issues")
@@ -248,9 +325,30 @@ def cmd_check(args) -> int:
     return 0
 
 
+def cmd_remove(args) -> int:
+    """Delete an entry by citation key — the sanctioned way to drop a bad
+    entry without hand-editing the file."""
+    path = Path(args.file)
+    removed = bibfile.remove_entry(path, args.key)
+    tidied = False
+    if removed and not args.no_tidy:
+        tidied = bibfile.run_tidy(path)
+    _emit(
+        {
+            "action": "removed" if removed else "not_found",
+            "key": args.key,
+            "file": str(path),
+            "tidied": tidied,
+        }
+    )
+    return 0 if removed else EXIT_NOT_FOUND
+
+
 def cmd_fix(args) -> int:
     """One-shot cleanup: upgrade preprints, always tidy, then re-lint."""
     path = Path(args.file)
+    if args.no_cache:
+        cache.DISABLED = True
     if not path.exists():
         _log(f"[bibcite] {path} does not exist")
         return 1
@@ -282,20 +380,31 @@ def main(argv=None) -> int:
     g.add_argument("query", nargs="+", help="arXiv id / arXiv URL / DOI / title")
     g.add_argument("--json", action="store_true", help="print a JSON object instead of BibTeX")
     g.add_argument("--require-published", action="store_true", help="fail instead of falling back to an arXiv entry")
+    g.add_argument("--no-cache", action="store_true", help="bypass the local match cache")
     g.set_defaults(fn=cmd_get)
 
     a = sub.add_parser("add", help="resolve and write into a .bib file, then run bibtex-tidy (prints JSON)")
     a.add_argument("file", help="target .bib file (created if missing)")
     a.add_argument("query", nargs="*", help="arXiv id / arXiv URL / DOI / title")
     a.add_argument("--bibtex", help="raw BibTeX entry to add instead of a query ('-' reads stdin)")
+    a.add_argument("--from", dest="from_file", metavar="FILE", help="batch mode: one query per line (shares rate-limit state, tidies once)")
+    a.add_argument("--replace", action="store_true", help="overwrite an existing matching entry (keeps its citation key)")
     a.add_argument("--no-tidy", action="store_true")
+    a.add_argument("--no-cache", action="store_true", help="bypass the local match cache")
     a.add_argument("--require-published", action="store_true")
     a.set_defaults(fn=cmd_add)
+
+    rm = sub.add_parser("remove", help="delete an entry by citation key (prints JSON)")
+    rm.add_argument("file")
+    rm.add_argument("key", help="citation key of the entry to remove")
+    rm.add_argument("--no-tidy", action="store_true")
+    rm.set_defaults(fn=cmd_remove)
 
     u = sub.add_parser("upgrade", help="match all arXiv entries in a file to their published versions (prints JSON)")
     u.add_argument("file")
     u.add_argument("--dry-run", action="store_true")
     u.add_argument("--no-tidy", action="store_true")
+    u.add_argument("--no-cache", action="store_true", help="bypass the local match cache")
     u.set_defaults(fn=cmd_upgrade)
 
     t = sub.add_parser("tidy", help="run bibtex-tidy with the canonical flags")
@@ -311,6 +420,7 @@ def main(argv=None) -> int:
         help="one-shot cleanup: upgrade preprints to published versions, tidy, then lint (prints JSON)",
     )
     f.add_argument("file")
+    f.add_argument("--no-cache", action="store_true", help="bypass the local match cache")
     f.set_defaults(fn=cmd_fix)
 
     args = p.parse_args(argv)

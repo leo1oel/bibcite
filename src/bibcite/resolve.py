@@ -10,7 +10,17 @@ import sys
 from dataclasses import dataclass
 
 from .bibfile import NOISE_FIELDS, parse_bibtex_entry
-from .normalize import clean_title, first_author_last_name, make_key
+from .normalize import clean_title, first_author_last_name, fix_author_caps, make_key
+
+
+class NotFound(Exception):
+    """No source could resolve the query — asking for a better identifier is
+    the right next step."""
+
+
+class SourcesUnavailable(Exception):
+    """Resolution failed because sources were down/rate-limited, NOT because
+    the paper doesn't exist. Retrying later is the right next step."""
 from .sources import (
     ArxivMeta,
     Match,
@@ -84,7 +94,10 @@ def _entry_from_match(match: Match, meta: ArxivMeta | None) -> dict:
     if match.bibtex:
         try:
             entry = parse_bibtex_entry(match.bibtex)
-        except ValueError:
+        except Exception as e:
+            # Bad source bibtex must degrade to field construction, never
+            # abort the resolution.
+            _log(f"[{match.source}] could not parse its BibTeX ({e}); building from fields")
             entry = {}
     if not entry:
         authors = match.authors or (meta.authors if meta else [])
@@ -100,6 +113,8 @@ def _entry_from_match(match: Match, meta: ArxivMeta | None) -> dict:
         entry.pop(f, None)
 
     entry["title"] = clean_title(entry.get("title", ""))
+    if entry.get("author"):
+        entry["author"] = fix_author_caps(entry["author"])
     if match.doi and not entry.get("doi"):
         entry["doi"] = match.doi
 
@@ -132,8 +147,12 @@ def _finalize(entry: dict, meta: ArxivMeta | None) -> dict:
         entry["archiveprefix"] = "arXiv"
         if meta.primary_class:
             entry["primaryclass"] = meta.primary_class
-    elif entry.get("doi") and not entry.get("url"):
-        entry["url"] = f"https://doi.org/{entry['doi']}"
+    elif entry.get("doi"):
+        url = entry.get("url", "")
+        # Modernize legacy resolver links (http://dx.doi.org/...) and fill in
+        # a missing url from the DOI.
+        if not url or "dx.doi.org" in url:
+            entry["url"] = f"https://doi.org/{entry['doi']}"
     author = entry.get("author", "") or "anonymous"
     year = entry.get("year", "") or "XXXX"
     entry["ID"] = make_key(author, year, entry.get("title", ""))
@@ -176,19 +195,23 @@ def resolve(query: str, require_published: bool = False) -> Resolved:
                 if meta is not None:
                     break
             if meta is None:
-                raise LookupError(
+                raise SourcesUnavailable(
                     f"Could not fetch metadata for arXiv:{value} "
                     "(arXiv API, Semantic Scholar, and arxiv.org all unavailable)"
                 )
         _log(f"[arxiv] {meta.title} ({meta.year})")
         hint = first_author_last_name(meta.authors[0]) if meta.authors else ""
-        match = find_published(meta.title, meta.year, meta.arxiv_id, hint)
+        match, status = find_published(meta.title, meta.year, meta.arxiv_id, hint)
         if match:
             entry = _entry_from_match(match, meta)
             venue = entry.pop("__venue", match.venue)
             return Resolved(_finalize(entry, meta), match.source, venue, True)
         if require_published:
-            raise LookupError(f"No published version found for arXiv:{value}")
+            if status == "unavailable":
+                raise SourcesUnavailable(
+                    f"Could not check publication status for arXiv:{value} (sources down)"
+                )
+            raise NotFound(f"No published version found for arXiv:{value}")
         _log("[bibcite] no published version found; using arXiv preprint entry")
         entry = _arxiv_only_entry(meta)
         return Resolved(_finalize(entry, meta), "arxiv", "", False)
@@ -196,7 +219,7 @@ def resolve(query: str, require_published: bool = False) -> Resolved:
     if kind == "doi":
         match = crossref_by_doi(value)
         if not match or not match.title:
-            raise LookupError(f"DOI not found on CrossRef: {value}")
+            raise NotFound(f"DOI not found on CrossRef: {value}")
         entry = _entry_from_match(match, None)
         venue = entry.pop("__venue", match.venue)
         return Resolved(_finalize(entry, None), match.source, venue, True)
@@ -212,7 +235,7 @@ def resolve(query: str, require_published: bool = False) -> Resolved:
         if meta:
             _log(f"[openalex] metadata: arXiv {meta.arxiv_id or '?'} ({meta.year})")
     hint = first_author_last_name(meta.authors[0]) if meta and meta.authors else ""
-    match = find_published(
+    match, status = find_published(
         meta.title if meta else value,
         meta.year if meta else "",
         meta.arxiv_id if meta else "",
@@ -224,11 +247,15 @@ def resolve(query: str, require_published: bool = False) -> Resolved:
         return Resolved(_finalize(entry, meta), match.source, venue, True)
     if meta and meta.arxiv_id:
         if require_published:
-            raise LookupError(f"Only an arXiv preprint was found for: {value}")
+            raise NotFound(f"Only an arXiv preprint was found for: {value}")
         _log("[bibcite] no published version found; using arXiv preprint entry")
         entry = _arxiv_only_entry(meta)
         return Resolved(_finalize(entry, meta), "arxiv", "", False)
-    raise LookupError(f"No match found anywhere for: {value}")
+    if status == "unavailable":
+        raise SourcesUnavailable(
+            f"All sources were rate-limited or down while resolving: {value}"
+        )
+    raise NotFound(f"No match found anywhere for: {value}")
 
 
 def _openalex_meta(title: str) -> ArxivMeta | None:

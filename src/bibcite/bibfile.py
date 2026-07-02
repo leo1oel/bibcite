@@ -14,7 +14,10 @@ from bibtexparser.bwriter import BibTexWriter
 from .normalize import norm_title
 
 # The exact bibtex-tidy invocation requested by the user; keep in sync with
-# their LaTeX workflow.
+# their LaTeX workflow. NOTE: no --generate-keys — bibcite owns key
+# generation (make_key ASCII-folds names, so Hyvärinen -> hyvarinen2000...,
+# where tidy would emit hyv_arinen2000...), and stable keys keep existing
+# \cite{} commands valid.
 TIDY_ARGS = [
     "--modify",
     "--omit=pages,publisher,doi,timestamp,biburl,bibsource,abstract,month,series,volume,editor,note,date,number,address",
@@ -27,10 +30,26 @@ TIDY_ARGS = [
     "--sort-fields=author,title,booktitle,journal,year,url,pdf",
     "--strip-enclosing-braces",
     "--tidy-comments",
-    "--generate-keys",
 ]
 
-NOISE_FIELDS = ("timestamp", "biburl", "bibsource", "crossref")
+NOISE_FIELDS = ("timestamp", "biburl", "bibsource", "crossref", "month")
+
+# BibTeX month macros. bibtexparser's common_strings only defines jan..dec;
+# CrossRef's transform endpoint emits bare full names (month=June), which
+# otherwise KeyError during string interpolation.
+MONTH_STRINGS = {
+    m[:3]: m.capitalize()
+    for m in (
+        "january february march april may june july august september "
+        "october november december"
+    ).split()
+} | {
+    m: m.capitalize()
+    for m in (
+        "january february march april may june july august september "
+        "october november december"
+    ).split()
+}
 
 ARXIV_ID_RE = re.compile(r"(\d{4}\.\d{4,5})(v\d+)?")
 
@@ -42,11 +61,18 @@ def _log(msg: str):
 def _parser() -> BibTexParser:
     p = BibTexParser(common_strings=True)
     p.ignore_nonstandard_types = False
+    p.bib_database.strings.update(MONTH_STRINGS)
     return p
 
 
 def parse_bib(text: str) -> BibDatabase:
-    return bibtexparser.loads(text, parser=_parser())
+    try:
+        return bibtexparser.loads(text, parser=_parser())
+    except Exception as e:
+        # Undefined @string macros raise bare KeyError('macro'); rewrap so
+        # callers see a real message and KeyError never masquerades as a
+        # LookupError "not found" upstream.
+        raise ValueError(f"BibTeX parse failed: {type(e).__name__}: {e}") from e
 
 
 def parse_bibtex_entry(text: str) -> dict:
@@ -117,10 +143,12 @@ def find_existing(db: BibDatabase, title: str, arxiv_id: str = "", doi: str = ""
     return None
 
 
-def upsert_entry(path: Path, entry: dict) -> tuple[str, str]:
+def upsert_entry(path: Path, entry: dict, replace: bool = False) -> tuple[str, str]:
     """Insert or upgrade ``entry`` in ``path``.
 
-    Returns (action, key) where action is "added" | "upgraded" | "exists".
+    Returns (action, key), action in "added" | "upgraded" | "exists" |
+    "replaced". With ``replace``, an existing matching entry is overwritten
+    (its citation key is kept so existing \\cite{} commands stay valid).
     """
     db = load_bib_file(path)
     if db is None:  # unparseable file: append blindly
@@ -132,18 +160,33 @@ def upsert_entry(path: Path, entry: dict) -> tuple[str, str]:
         db, entry.get("title", ""), entry_arxiv_id(entry), entry.get("doi", "")
     )
     if existing is not None:
-        if is_preprint(existing) and not is_preprint(entry):
+        upgrade = is_preprint(existing) and not is_preprint(entry)
+        if replace or upgrade:
             key = existing["ID"]
             existing.clear()
-            existing.update(entry)
+            existing.update({k: str(v) for k, v in entry.items() if v})
             existing["ID"] = key  # keep the key the user may already \cite
             _write_db(path, db)
-            return "upgraded", key
+            return ("replaced" if replace else "upgraded"), key
         return "exists", existing["ID"]
 
     db.entries.append({k: str(v) for k, v in entry.items() if v})
     _write_db(path, db)
     return "added", entry["ID"]
+
+
+def remove_entry(path: Path, key: str) -> bool:
+    """Delete the entry with citation key ``key``. True if something was
+    removed."""
+    db = load_bib_file(path)
+    if db is None:
+        return False
+    before = len(db.entries)
+    db.entries = [e for e in db.entries if e.get("ID") != key]
+    if len(db.entries) == before:
+        return False
+    _write_db(path, db)
+    return True
 
 
 def _write_db(path: Path, db: BibDatabase):
