@@ -31,6 +31,16 @@ npm install -g bibtex-tidy
 
 To use your own venue table instead of the vendored one, set `BIBCITE_STRINGS=/path/to/strings.bib` or place it at `~/.config/bibcite/strings.bib`.
 
+Environment variables that make the sources faster/more reliable:
+
+| Variable | Effect |
+|---|---|
+| `OPENALEX_API_KEY` | OpenAlex refuses anonymous search with 503 under load; a free key makes it dependable |
+| `S2_API_KEY` | Semantic Scholar private quota (~1 req/s) instead of the shared global pool |
+| `BIBCITE_MAILTO` | Your contact email for the CrossRef/OpenAlex/Unpaywall polite pools |
+| `BIBCITE_CORE_SOURCES` | Override which sources count as "core" for `published_check` verdicts (default `dblp,semanticscholar,crossref,openalex`) |
+| `BIBCITE_NO_CACHE=1` | Disable the local match cache |
+
 ## Usage
 
 ```bash

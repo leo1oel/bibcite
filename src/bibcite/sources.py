@@ -18,7 +18,7 @@ import httpx
 
 from .normalize import clean_title, mini_hash, norm_title, sig_tokens, titles_similar
 
-UA = "bibcite/0.1 (https://github.com/leonardo/bibcite; mailto:bibcite@gmail.com)"
+UA = "bibcite/0.5 (https://github.com/leo1oel/bibcite)"
 BROWSER_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
@@ -51,6 +51,22 @@ def _s2_headers() -> dict:
     quota. Set S2_API_KEY (or SEMANTIC_SCHOLAR_API_KEY)."""
     key = os.environ.get("S2_API_KEY") or os.environ.get("SEMANTIC_SCHOLAR_API_KEY")
     return {"x-api-key": key} if key else {}
+
+
+def _mailto() -> str:
+    """Contact email for the polite pools (CrossRef/OpenAlex/Unpaywall).
+    Set BIBCITE_MAILTO to use your own."""
+    return os.environ.get("BIBCITE_MAILTO") or "bibcite@gmail.com"
+
+
+def _openalex_params(extra: dict) -> dict:
+    """OpenAlex rejects ANONYMOUS search with 503 under heavy load ("use a
+    free API key for uninterrupted access"); OPENALEX_API_KEY unlocks it."""
+    params = {**extra, "mailto": _mailto()}
+    key = os.environ.get("OPENALEX_API_KEY")
+    if key:
+        params["api_key"] = key
+    return params
 
 
 @dataclass
@@ -147,40 +163,50 @@ def arxiv_metadata(arxiv_id: str) -> ArxivMeta:
 # DBLP
 # ---------------------------------------------------------------------------
 
-# DBLP throttles at roughly 1-2 req/s and escalates to temporary IP bans when
-# hammered. Client-side pacing prevents the 429 in the first place; on a 429
-# we back off and retry (honoring Retry-After) instead of instantly poisoning
-# the rest of a batch run — only repeated failure disables the source.
-_DBLP_MIN_INTERVAL = 0.8
-_dblp_last_request = 0.0
+# Client-side pacing + backoff-retry, shared by the throttle-prone sources.
+# Pacing prevents the 429 in the first place; on a 429 we back off (honoring
+# Retry-After) instead of instantly poisoning the rest of a batch run — only
+# repeated failure raises SourceUnavailable (which disables the source).
+_LAST_REQUEST: dict[str, float] = {}
 
 
-def _dblp_get(c: httpx.Client, url: str, params: dict | None = None) -> httpx.Response:
-    global _dblp_last_request
+def _paced_get(
+    c: httpx.Client,
+    url: str,
+    source: str,
+    min_interval: float,
+    params: dict | None = None,
+    headers: dict | None = None,
+) -> httpx.Response:
     for attempt in range(3):
-        wait = _DBLP_MIN_INTERVAL - (time.monotonic() - _dblp_last_request)
+        wait = min_interval - (time.monotonic() - _LAST_REQUEST.get(source, 0.0))
         if wait > 0:
             time.sleep(wait)
-        _dblp_last_request = time.monotonic()
+        _LAST_REQUEST[source] = time.monotonic()
         try:
-            r = c.get(url, params=params)
+            r = c.get(url, params=params, headers=headers)
         except httpx.HTTPError as e:  # TCP reset = temporary ban; retrying fast makes it worse
             if attempt < 2:
                 time.sleep(5 * (attempt + 1))
                 continue
-            raise SourceUnavailable(f"DBLP unreachable ({type(e).__name__})")
+            raise SourceUnavailable(f"{source} unreachable ({type(e).__name__})")
         if r.status_code == 429:
             retry_after = int(r.headers.get("Retry-After") or 0)
             if retry_after > 30:
-                raise SourceUnavailable(f"DBLP rate-limited (Retry-After {retry_after}s)")
+                raise SourceUnavailable(f"{source} rate-limited (Retry-After {retry_after}s)")
             if attempt < 2:
                 delay = max(retry_after, 4 * (attempt + 1))
-                _log(f"[dblp] 429 — backing off {delay}s")
+                _log(f"[{source}] 429 — backing off {delay}s")
                 time.sleep(delay)
                 continue
-            raise SourceUnavailable("DBLP rate-limited (429) after backoff retries")
+            raise SourceUnavailable(f"{source} rate-limited (429) after backoff retries")
         return r
-    raise SourceUnavailable("DBLP unavailable")
+    raise SourceUnavailable(f"{source} unavailable")
+
+
+# DBLP throttles at roughly 1-2 req/s and escalates to temporary IP bans.
+def _dblp_get(c: httpx.Client, url: str, params: dict | None = None) -> httpx.Response:
+    return _paced_get(c, url, "dblp", 0.8, params=params)
 
 
 def try_dblp(title: str, author_hint: str = "") -> Match | None:
@@ -369,14 +395,22 @@ def arxiv_abs_metadata(arxiv_id: str) -> ArxivMeta | None:
     )
 
 
+def _s2_get(c: httpx.Client, url: str, params: dict) -> httpx.Response:
+    # With an API key S2 allows ~1 req/s on a private quota; unauthenticated
+    # requests share a global pool where backoff still beats instant defeat.
+    return _paced_get(
+        c, url, "semanticscholar", 1.0, params=params, headers=_s2_headers()
+    )
+
+
 def s2_arxiv_metadata(arxiv_id: str) -> ArxivMeta | None:
     """Metadata (title/authors/year) for an arXiv id via Semantic Scholar —
     the fallback when export.arxiv.org itself is throttled."""
     with _client() as c:
-        r = c.get(
+        r = _s2_get(
+            c,
             f"https://api.semanticscholar.org/graph/v1/paper/arXiv:{arxiv_id}",
             params={"fields": "title,year,authors"},
-            headers=_s2_headers(),
         )
         if r.status_code != 200:
             return None
@@ -398,24 +432,20 @@ def try_semantic_scholar(
     with _client() as c:
         # Direct id lookup first: unambiguous, no title-search needed.
         if arxiv_id:
-            r = c.get(
+            r = _s2_get(
+                c,
                 f"https://api.semanticscholar.org/graph/v1/paper/arXiv:{arxiv_id}",
                 params={"fields": S2_FIELDS},
-                headers=_s2_headers(),
             )
-            if r.status_code == 429:
-                raise SourceUnavailable("Semantic Scholar rate-limited (429)")
             if r.status_code == 200:
                 m = _s2_to_match(r.json(), title, year)
                 if m:
                     return m
-        r = c.get(
+        r = _s2_get(
+            c,
             "https://api.semanticscholar.org/graph/v1/paper/search",
             params={"query": title, "fields": S2_FIELDS, "limit": 5},
-            headers=_s2_headers(),
         )
-        if r.status_code == 429:
-            raise SourceUnavailable("Semantic Scholar rate-limited (429)")
         r.raise_for_status()
         for item in r.json().get("data") or []:
             m = _s2_to_match(item, title, year)
@@ -491,7 +521,7 @@ def try_crossref(title: str) -> Match | None:
                 "rows": 3,
                 "query.title": title,
                 "select": "title,event,container-title,DOI,issued",
-                "mailto": "bibcite@gmail.com",
+                "mailto": _mailto(),
             },
         )
         if r.status_code == 429:
@@ -544,7 +574,7 @@ def try_unpaywall(title: str) -> Match | None:
     with _client() as c:
         r = c.get(
             "https://api.unpaywall.org/v2/search",
-            params={"query": title, "is_oa": "true", "email": "bibcite@gmail.com"},
+            params={"query": title, "is_oa": "true", "email": _mailto()},
         )
         if r.status_code == 429:
             raise SourceUnavailable("Unpaywall rate-limited (429)")
@@ -586,7 +616,7 @@ def openalex_search(title: str) -> dict | None:
     with _client() as c:
         r = c.get(
             "https://api.openalex.org/works",
-            params={"search": title, "per-page": 5, "mailto": "bibcite@gmail.com"},
+            params=_openalex_params({"search": title, "per-page": 5}),
         )
         if r.status_code == 429:
             raise SourceUnavailable("OpenAlex rate-limited (429)")
@@ -651,7 +681,7 @@ def try_openalex(title: str) -> Match | None:
 
 def crossref_by_doi(doi: str) -> Match | None:
     with _client() as c:
-        r = c.get(f"https://api.crossref.org/works/{doi}", params={"mailto": "bibcite@gmail.com"})
+        r = c.get(f"https://api.crossref.org/works/{doi}", params={"mailto": _mailto()})
         if r.status_code != 200:
             return None
         data = r.json().get("message", {})
@@ -702,7 +732,15 @@ _DISABLED: dict[str, str] = {}
 # Only these sources are authoritative enough that losing one taints a miss
 # into "incomplete". Google Scholar captchas and Unpaywall flakiness are
 # routine and must not stop "not_found" from ever being trustworthy.
-CORE_SOURCES = frozenset({"dblp", "semanticscholar", "crossref", "openalex"})
+# Override with BIBCITE_CORE_SOURCES="dblp,semanticscholar" if one of these
+# is down for days and keeps every verdict incomplete.
+CORE_SOURCES = frozenset(
+    s.strip()
+    for s in (
+        os.environ.get("BIBCITE_CORE_SOURCES") or "dblp,semanticscholar,crossref,openalex"
+    ).split(",")
+    if s.strip()
+)
 
 
 def find_published(
