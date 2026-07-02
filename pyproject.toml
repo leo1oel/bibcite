@@ -1,0 +1,30 @@
+[project]
+name = "bibcite-cli"
+version = "0.2.0"
+description = "Resolve papers (arXiv id / DOI / title) to canonical, normalized BibTeX for agents and humans"
+readme = "Readme.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = [
+    "bibtexparser>=1.4,<2",
+    "httpx>=0.27",
+]
+keywords = ["bibtex", "arxiv", "citations", "dblp", "bibliography"]
+
+[project.urls]
+Repository = "https://github.com/leo1oel/bibcite"
+
+[project.scripts]
+bibcite = "bibcite.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bibcite"]
