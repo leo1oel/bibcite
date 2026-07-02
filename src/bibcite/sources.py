@@ -526,6 +526,11 @@ def try_crossref(title: str) -> Match | None:
         )
         if r.status_code == 429:
             raise SourceUnavailable("CrossRef rate-limited (429)")
+        if r.status_code >= 500:
+            # A dead endpoint (Unpaywall search 500s for days at a time)
+            # gets benched for the run instead of adding latency + noise
+            # to every remaining query.
+            raise SourceUnavailable(f"CrossRef server error ({r.status_code})")
         r.raise_for_status()
         payload = r.json()
         if payload.get("status") != "ok":
@@ -578,6 +583,11 @@ def try_unpaywall(title: str) -> Match | None:
         )
         if r.status_code == 429:
             raise SourceUnavailable("Unpaywall rate-limited (429)")
+        if r.status_code >= 500:
+            # A dead endpoint (Unpaywall search 500s for days at a time)
+            # gets benched for the run instead of adding latency + noise
+            # to every remaining query.
+            raise SourceUnavailable(f"Unpaywall server error ({r.status_code})")
         r.raise_for_status()
         ref = norm_title(title)
         for res in r.json().get("results") or []:
@@ -620,6 +630,11 @@ def openalex_search(title: str) -> dict | None:
         )
         if r.status_code == 429:
             raise SourceUnavailable("OpenAlex rate-limited (429)")
+        if r.status_code >= 500:
+            # A dead endpoint (Unpaywall search 500s for days at a time)
+            # gets benched for the run instead of adding latency + noise
+            # to every remaining query.
+            raise SourceUnavailable(f"OpenAlex server error ({r.status_code})")
         r.raise_for_status()
         ref = norm_title(title)
         for w in r.json().get("results") or []:
