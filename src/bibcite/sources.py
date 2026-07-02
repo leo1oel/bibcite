@@ -209,6 +209,28 @@ def _dblp_get(c: httpx.Client, url: str, params: dict | None = None) -> httpx.Re
     return _paced_get(c, url, "dblp", 0.8, params=params)
 
 
+def _dblp_sanitize(q: str) -> str:
+    """DBLP's search parser 500s deterministically on queries containing its
+    syntax characters (':' in subtitled papers, '?' in question titles).
+    They tokenize on punctuation anyway, so replacing with spaces loses
+    nothing."""
+    return re.sub(r"[^\w\s.-]", " ", q)
+
+
+def _dblp_search(c: httpx.Client, q: str, h: int = 100) -> list:
+    """One search request; a 500 (broad all-common-words query × large h
+    times out their backend) is retried once with a small result window
+    before giving up on this query variant."""
+    url = "https://dblp.org/search/publ/api"
+    q = _dblp_sanitize(q)
+    r = _dblp_get(c, url, params={"q": q, "format": "json", "h": h})
+    if r.status_code == 500 and h > 10:
+        _log("[dblp] 500 on broad query — retrying with h=10")
+        r = _dblp_get(c, url, params={"q": q, "format": "json", "h": 10})
+    r.raise_for_status()
+    return r.json().get("result", {}).get("hits", {}).get("hit", []) or []
+
+
 def try_dblp(title: str, author_hint: str = "") -> Match | None:
     """DBLP search. Generic titles ("X is all you need") drown in DBLP's
     ranking, so when we know the first author we query with their last name
@@ -219,15 +241,7 @@ def try_dblp(title: str, author_hint: str = "") -> Match | None:
     queries.append(title)
     with _client() as c:
         for q in queries:
-            r = _dblp_get(
-                c,
-                "https://dblp.org/search/publ/api",
-                params={"q": q, "format": "json", "h": 100},
-            )
-            r.raise_for_status()
-            hits = (
-                r.json().get("result", {}).get("hits", {}).get("hit", []) or []
-            )
+            hits = _dblp_search(c, q)
             # Earliest year first: prefer the original conference publication
             # over later journal extensions (same heuristic as PaperMemory).
             hits.sort(key=lambda h: int(h.get("info", {}).get("year", 9999)))
@@ -283,13 +297,7 @@ def try_dblp_fuzzy(title: str, author_hint: str, year: str = "") -> Match | None
         return None
     q = " ".join([author_hint] + tokens)
     with _client() as c:
-        r = _dblp_get(
-            c,
-            "https://dblp.org/search/publ/api",
-            params={"q": q, "format": "json", "h": 100},
-        )
-        r.raise_for_status()
-        hits = r.json().get("result", {}).get("hits", {}).get("hit", []) or []
+        hits = _dblp_search(c, q)
         hits.sort(key=lambda h: int(h.get("info", {}).get("year", 9999)))
         for hit in hits:
             info = hit.get("info", {})

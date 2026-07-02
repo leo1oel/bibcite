@@ -20,16 +20,14 @@ from .normalize import norm_title
 # \cite{} commands valid.
 TIDY_ARGS = [
     "--modify",
-    # volume/number/pages/doi are kept (bibliographic substance the user
-    # asked to retain); the omit list drops only true noise.
-    "--omit=publisher,timestamp,biburl,bibsource,abstract,month,series,editor,note,date,address",
+    "--omit=pages,publisher,doi,timestamp,biburl,bibsource,abstract,month,series,volume,editor,note,date,number,address",
     "--curly",
     "--blank-lines",
     "--trailing-commas",
     "--sort=-year",
     "--duplicates=citation",
     "--merge=first",
-    "--sort-fields=author,title,booktitle,journal,volume,number,pages,year,doi,url,pdf",
+    "--sort-fields=author,title,booktitle,journal,year,url,pdf",
     "--strip-enclosing-braces",
     "--tidy-comments",
 ]

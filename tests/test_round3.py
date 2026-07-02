@@ -84,3 +84,11 @@ def test_scrub_leaves_clean_files_alone(tmp_path: Path):
     bib.write_text(original)
     _scrub_month_strings(bib)
     assert bib.read_text() == original  # untouched, not even rewritten
+
+
+def test_dblp_sanitize_strips_syntax_chars():
+    from bibcite.sources import _dblp_sanitize
+
+    q = _dblp_sanitize("LeJEPA: Provable? Self-Supervised (Learning)")
+    assert ":" not in q and "?" not in q and "(" not in q
+    assert "Self-Supervised" in q  # hyphens survive
