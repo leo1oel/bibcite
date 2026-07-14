@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title description">
+  <title id="title">bibcite logo</title>
+  <desc id="description">A paper with citation marks and a verification check.</desc>
+  <defs>
+    <linearGradient id="background" x1="32" y1="24" x2="224" y2="232" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#6366F1"/>
+      <stop offset="1" stop-color="#7C3AED"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="8" stdDeviation="8" flood-color="#312E81" flood-opacity="0.28"/>
+    </filter>
+  </defs>
+  <rect width="256" height="256" rx="56" fill="url(#background)"/>
+  <path d="M67 48h89l37 37v116c0 9.4-7.6 17-17 17H67c-9.4 0-17-7.6-17-17V65c0-9.4 7.6-17 17-17Z" fill="#FFFFFF" filter="url(#shadow)"/>
+  <path d="M156 48v28c0 9.4 7.6 17 17 17h20" fill="#E0E7FF"/>
+  <path d="m156 48 37 37h-28c-5 0-9-4-9-9V48Z" fill="#C7D2FE"/>
+  <path d="M81 112c-8 4-12 11-12 22v18h22v-20H80c0-5 3-9 9-12l-8-8Zm40 0c-8 4-12 11-12 22v18h22v-20h-11c0-5 3-9 9-12l-8-8Z" fill="#6366F1"/>
+  <rect x="70" y="172" width="69" height="10" rx="5" fill="#CBD5E1"/>
+  <circle cx="181" cy="184" r="35" fill="#14B8A6" stroke="#FFFFFF" stroke-width="8"/>
+  <path d="m165 184 11 11 22-25" fill="none" stroke="#FFFFFF" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

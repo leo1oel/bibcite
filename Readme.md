@@ -1,85 +1,173 @@
-# bibcite
+<p align="center">
+  <img src="assets/bibcite.svg" width="128" alt="bibcite logo">
+</p>
 
-Resolve papers (arXiv id / DOI / title) to canonical, normalized BibTeX, and manage `.bib` files so agents never hand-edit them.
+<h1 align="center">bibcite</h1>
 
-The publication-matching cascade is ported from [PaperMemory](https://github.com/vict0rsch/PaperMemory)'s bibMatcher:
-DBLP → Semantic Scholar → Google Scholar → CrossRef → Unpaywall.
-A match must have an identical normalized title, a plausible year, and a non-preprint venue.
+<p align="center">
+  Turn an arXiv ID, DOI, or paper title into clean BibTeX, then keep the whole bibliography normalized and deduplicated.
+</p>
 
-Venue names are canonicalized against the `@string` table vendored in `src/bibcite/data/strings.bib` (journals / conferences / workshops), including year-aware rules (NIPS before 2018 vs NeurIPS, WACV before 2017).
+<p align="center">
+  <a href="https://pypi.org/project/bibcite-cli/"><img alt="PyPI" src="https://img.shields.io/pypi/v/bibcite-cli?color=6366f1"></a>
+  <a href="https://pypi.org/project/bibcite-cli/"><img alt="Python" src="https://img.shields.io/pypi/pyversions/bibcite-cli"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/leo1oel/bibcite"></a>
+</p>
 
-Entry types are strict: conference/workshop papers become `@inproceedings` + `booktitle`, journal papers `@article` + `journal`, and unpublished arXiv preprints `@misc` + `howpublished = {arXiv preprint arXiv:ID}`.
-Types coming from authoritative source BibTeX (DBLP) are preserved.
+`bibcite` resolves a paper to its published record when one exists, preserves arXiv links, canonicalizes venue names, and writes the result into a `.bib` file without breaking existing citation keys.
+It is built for both terminal use and coding agents that need a dependable alternative to editing BibTeX by hand.
 
-After every write, the file is formatted with [bibtex-tidy](https://github.com/FlamingTempura/bibtex-tidy) using the canonical flags in `bibfile.TIDY_ARGS` (requires `bibtex-tidy` on PATH or `npx`).
+## Quick start
 
-## Install
+Install the command from PyPI:
 
 ```bash
-# from a local checkout (development)
-uv tool install --editable .
+uv tool install bibcite-cli
+```
 
-# from git, no checkout needed
-uv tool install git+https://github.com/leo1oel/bibcite
+Resolve a paper and add it to your bibliography:
 
-# once published to PyPI (package name bibcite-cli, command name bibcite)
-uv tool install bibcite-cli   # or: uvx --from bibcite-cli bibcite ...
+```bash
+bibcite add references.bib 1706.03762
+```
 
-# plus, once (required for the tidy step):
+The command prints a machine-readable result, including the stable citation key:
+
+```json
+{
+  "query": "1706.03762",
+  "action": "added",
+  "key": "vaswani2017attention",
+  "title": "Attention is All you Need",
+  "venue": "Advances in Neural Information Processing Systems (NIPS)",
+  "published": true,
+  "source": "semanticscholar",
+  "file": "references.bib",
+  "tidied": true
+}
+```
+
+You can now cite it as `\cite{vaswani2017attention}`.
+Running the same command again is safe: `bibcite` detects the existing entry and does not add a duplicate.
+
+`bibcite` uses [bibtex-tidy](https://github.com/FlamingTempura/bibtex-tidy) for final formatting.
+Install it once if you want write commands to tidy the file automatically:
+
+```bash
 npm install -g bibtex-tidy
 ```
 
-To use your own venue table instead of the vendored one, set `BIBCITE_STRINGS=/path/to/strings.bib` or place it at `~/.config/bibcite/strings.bib`.
-
-Environment variables that make the sources faster/more reliable:
-
-| Variable | Effect |
-|---|---|
-| `OPENALEX_API_KEY` | OpenAlex refuses anonymous search with 503 under load; a free key makes it dependable |
-| `S2_API_KEY` | Semantic Scholar private quota (~1 req/s) instead of the shared global pool |
-| `BIBCITE_MAILTO` | Your contact email for the CrossRef/OpenAlex/Unpaywall polite pools |
-| `BIBCITE_CORE_SOURCES` | Override which sources count as "core" for `published_check` verdicts (default `dblp,semanticscholar,crossref,openalex`) |
-| `BIBCITE_NO_CACHE=1` | Disable the local match cache |
-
-## Usage
+You can also try a one-off command without installing `bibcite`:
 
 ```bash
-# Preview the BibTeX for a paper (nothing written)
-bibcite get 1706.03762
-bibcite get "Attention is all you need"
-bibcite get 10.1109/CVPR52688.2022.01167
-
-# Resolve and write into a .bib file, dedupe, then bibtex-tidy; prints the final key
-bibcite add refs.bib 2103.14030 --json
-
-# Add a raw BibTeX entry you already have (venue still canonicalized, file still tidied)
-bibcite add refs.bib --bibtex "$(pbpaste)"
-
-# Batch add (one query per line; shares rate-limit state, tidies once)
-bibcite add refs.bib --from ids.txt
-
-# Overwrite a bad existing entry (keeps its key), or delete one
-bibcite add refs.bib <query> --replace
-bibcite remove refs.bib <key>
-
-# One-shot cleanup: upgrade preprints → tidy → lint
-bibcite fix refs.bib
-
-# Upgrade every arXiv entry in a file to its published version (bibMatcher, CLI-style)
-bibcite upgrade refs.bib --dry-run
-
-# Just format, or just lint (check is read-only)
-bibcite tidy refs.bib
-bibcite check refs.bib
+uvx --from bibcite-cli bibcite get "Attention is all you need"
 ```
 
-`add`/`upgrade`/`check`/`fix`/`remove` print a machine-readable JSON result on stdout (`action`, `key`, `venue`, `source`, ...); all diagnostics go to stderr.
-`add` is idempotent: an existing entry returns `action: exists` with its key, and an existing arXiv entry matched to a published version is upgraded in place, keeping its citation key.
-Exit codes: 0 success, 2 paper not found (ask for a better identifier), 3 sources/tool failure (retry later).
-Successful matches are cached at `~/.cache/bibcite/published.json` (published papers only — preprint status is never cached); bypass with `--no-cache` or `BIBCITE_NO_CACHE=1`.
-Entries marked `pubstate = {preprint}` are treated as confirmed preprint-only and muted from `check`/`upgrade`.
+## What it handles
 
-## For agents
+- It accepts arXiv IDs and URLs, arXiv DOIs such as `10.48550/arXiv.1706.03762`, standard DOIs, and paper titles.
+- It searches for a published version before falling back to an arXiv preprint, and it reports when source outages make that check incomplete.
+- It canonicalizes journal, conference, and workshop names against the bundled venue table, including year-sensitive names such as NIPS and NeurIPS.
+- It assigns the correct BibTeX entry type and field, such as `@inproceedings` with `booktitle` or `@article` with `journal`.
+- It deduplicates by arXiv ID, DOI, exact title, and similar titles from the same first author.
+- It upgrades preprints in place while preserving citation keys already used by your LaTeX source.
 
-Never edit `.bib` files by hand.
-Call `bibcite add <file> <query> --json` and use the returned `key` in `\cite{...}`.
+## Commands
+
+| Command | Purpose |
+| --- | --- |
+| `bibcite get <query>` | Preview resolved BibTeX without writing a file. |
+| `bibcite add <file> <query>` | Resolve, deduplicate, add, and tidy an entry. |
+| `bibcite add <file> --bibtex "..."` | Normalize and add a raw BibTeX entry. |
+| `bibcite add <file> --from ids.txt` | Add one query per line and tidy once at the end. |
+| `bibcite upgrade <file>` | Replace arXiv entries with published records when available. |
+| `bibcite check <file>` | Find missing fields, duplicates, preprints, and all-caps author names without changing the file. |
+| `bibcite tidy <file>` | Apply the canonical `bibtex-tidy` formatting rules. |
+| `bibcite fix <file>` | Upgrade preprints, tidy the file, and run the checks in one command. |
+| `bibcite remove <file> <key>` | Remove an entry by citation key. |
+
+### Common workflows
+
+Preview a result as BibTeX or JSON:
+
+```bash
+bibcite get 1706.03762
+bibcite get 10.1109/CVPR52688.2022.01167 --json
+```
+
+Add raw BibTeX from the clipboard:
+
+```bash
+pbpaste | bibcite add references.bib --bibtex -
+```
+
+Replace a bad entry while keeping its current key:
+
+```bash
+bibcite add references.bib "correct paper title" --key existingKey
+```
+
+Check what would be upgraded without writing the file:
+
+```bash
+bibcite upgrade references.bib --dry-run
+```
+
+Mark a confirmed preprint-only entry with `pubstate = {preprint}` if you want `check` and `upgrade` to leave it alone.
+
+## How resolution works
+
+For arXiv IDs and titles, `bibcite` collects paper metadata and checks publication sources in a cascade derived from [PaperMemory](https://github.com/vict0rsch/PaperMemory): DBLP, Semantic Scholar, Google Scholar, Crossref, Unpaywall, and OpenAlex.
+A published match must have the same normalized title or pass a guarded title-drift check, have a plausible publication year, and name a non-preprint venue.
+
+Successful published matches are cached at `~/.cache/bibcite/published.json`.
+Preprint-only results are never cached because a paper may be published later.
+Use `--no-cache` or set `BIBCITE_NO_CACHE=1` to bypass the cache.
+
+## Configuration
+
+Set `BIBCITE_STRINGS=/path/to/strings.bib` to use your own venue table, or place one at `~/.config/bibcite/strings.bib`.
+
+These optional environment variables improve source reliability:
+
+| Variable | Effect |
+| --- | --- |
+| `OPENALEX_API_KEY` | Uses your OpenAlex quota instead of the anonymous shared pool. |
+| `S2_API_KEY` | Uses a private Semantic Scholar quota. |
+| `BIBCITE_MAILTO` | Sends your contact email to the Crossref, OpenAlex, and Unpaywall polite pools. |
+| `BIBCITE_CORE_SOURCES` | Overrides the sources required for a trustworthy publication check. |
+| `BIBCITE_NO_CACHE=1` | Disables the local publication cache. |
+
+## Exit codes and agent use
+
+`add`, `remove`, `upgrade`, `check`, and `fix` print JSON on standard output and send diagnostics to standard error.
+This keeps their output easy to parse from scripts and agents.
+
+| Code | Meaning |
+| --- | --- |
+| `0` | The command completed successfully. |
+| `1` | A file, lint, or formatting problem remains. |
+| `2` | The paper or requested entry could not be found. |
+| `3` | Publication sources or an internal tool failed. |
+
+Agents should call `bibcite add <file> <query>` and use the returned `key` in `\cite{...}`.
+They should never modify `.bib` entries directly because doing so bypasses deduplication, venue normalization, and stable-key handling.
+
+## Development
+
+```bash
+git clone https://github.com/leo1oel/bibcite.git
+cd bibcite
+uv sync --all-groups
+uv run pytest
+```
+
+Install the checkout as an editable command while developing:
+
+```bash
+uv tool install --editable .
+```
+
+## License
+
+`bibcite` is available under the [MIT License](LICENSE).

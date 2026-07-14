@@ -18,7 +18,7 @@ import httpx
 
 from .normalize import clean_title, mini_hash, norm_title, sig_tokens, titles_similar
 
-UA = "bibcite/0.5 (https://github.com/leo1oel/bibcite)"
+UA = "bibcite/0.6 (https://github.com/leo1oel/bibcite)"
 BROWSER_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
@@ -35,6 +35,11 @@ def _log(msg: str):
 
 class SourceUnavailable(Exception):
     """Raised when a source rate-limits/blocks us; the cascade skips it."""
+
+
+class TransientSourceError(SourceUnavailable):
+    """Raised after request retries are exhausted without tripping the
+    process-wide circuit breaker for later batch entries."""
 
 
 def _client(browser: bool = False) -> httpx.Client:
@@ -185,11 +190,13 @@ def _paced_get(
         _LAST_REQUEST[source] = time.monotonic()
         try:
             r = c.get(url, params=params, headers=headers)
-        except httpx.HTTPError as e:  # TCP reset = temporary ban; retrying fast makes it worse
+        except httpx.HTTPError as e:  # Retry transport errors before failing this entry.
             if attempt < 2:
                 time.sleep(5 * (attempt + 1))
                 continue
-            raise SourceUnavailable(f"{source} unreachable ({type(e).__name__})")
+            raise TransientSourceError(
+                f"{source} unreachable ({type(e).__name__})"
+            ) from e
         if r.status_code == 429:
             retry_after = int(r.headers.get("Retry-After") or 0)
             if retry_after > 30:
@@ -747,9 +754,10 @@ CASCADE = (
     ("openalex", lambda t, y, a, au: try_openalex(t)),
 )
 
-# Sources that rate-limited/blocked us this process: skip them for the rest of
-# the run instead of hammering them once per entry during batch `upgrade`
-# (PaperMemory's DISABLE_MATCH, ported).
+# Sources that rate-limited or blocked us in this process: skip them for the
+# rest of the run instead of hammering them once per entry during batch
+# `upgrade` (PaperMemory's DISABLE_MATCH, ported). Exhausted transport retries
+# do not enter this circuit breaker because the next entry may succeed.
 _DISABLED: dict[str, str] = {}
 
 # Only these sources are authoritative enough that losing one taints a miss
@@ -800,6 +808,12 @@ def find_published(
                 return m, "found"
             clean_misses += 1
             _log(f"[{name}] no publication found")
+        except TransientSourceError as e:
+            incomplete = incomplete or name in CORE_SOURCES
+            _log(
+                f"[{name}] transient failure for this entry; "
+                f"will retry on the next: {e}"
+            )
         except SourceUnavailable as e:
             _DISABLED[name] = str(e)
             incomplete = incomplete or name in CORE_SOURCES
@@ -818,6 +832,9 @@ def find_published(
                 cache.put(cache_key, m.__dict__)
                 return m, "found"
             clean_misses += 1
+        except TransientSourceError as e:
+            incomplete = True
+            _log(f"[dblp-fuzzy] transient failure for this entry: {e}")
         except SourceUnavailable as e:
             _DISABLED["dblp"] = str(e)
             incomplete = True
