@@ -195,6 +195,10 @@ Install the checkout as an editable command while developing:
 uv tool install --editable .
 ```
 
+## Acknowledgements
+
+Inspired by [PaperMemory](https://github.com/vict0rsch/PaperMemory), with formatting by [bibtex-tidy](https://github.com/FlamingTempura/bibtex-tidy) and metadata from arXiv, DBLP, Semantic Scholar, Google Scholar, Crossref, Unpaywall, and OpenAlex.
+
 ## License
 
 `bibcite` is available under the [MIT License](LICENSE).
