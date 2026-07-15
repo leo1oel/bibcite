@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from bibcite import bibfile as bibfile_module
 from bibcite.bibfile import (
     entry_arxiv_id,
     entry_to_bibtex,
@@ -77,3 +78,12 @@ def test_find_existing_by_title_and_id(tmp_path: Path):
     assert find_existing(db, "attention is all you need") is not None
     assert find_existing(db, "", arxiv_id="1706.03762") is not None
     assert find_existing(db, "some other paper") is None
+
+
+def test_tidy_command_downloads_through_npx_when_not_installed(monkeypatch):
+    def which(command):
+        return "/usr/local/bin/npx" if command == "npx" else None
+
+    monkeypatch.setattr(bibfile_module.shutil, "which", which)
+
+    assert bibfile_module.tidy_command() == ["npx", "--yes", "bibtex-tidy"]

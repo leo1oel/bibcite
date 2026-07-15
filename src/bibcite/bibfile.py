@@ -280,7 +280,10 @@ def run_tidy(path: Path) -> bool:
     _scrub_month_strings(path)
     cmd = tidy_command()
     if cmd is None:
-        _log("[bibcite] bibtex-tidy not found (npm i -g bibtex-tidy); skipping tidy")
+        _log(
+            "[bibcite] cannot run bibtex-tidy: neither bibtex-tidy nor npx was found; "
+            "install Node.js/npm"
+        )
         return False
     proc = subprocess.run(
         cmd + [str(path)] + TIDY_ARGS, capture_output=True, text=True

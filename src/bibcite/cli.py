@@ -275,6 +275,8 @@ def cmd_add(args) -> int:
                     r["key"] = bibfile.key_after_tidy(path, r["title"], r["key"])
 
     exit_code = max((r.get("exit_code", 0) for r in results), default=0)
+    if wrote and not args.no_tidy and not tidied:
+        exit_code = max(exit_code, EXIT_ISSUES)
     if len(results) == 1 and not args.from_file:
         _emit({**results[0], "file": str(path), "tidied": tidied})
     else:
@@ -385,9 +387,12 @@ def cmd_upgrade(args) -> int:
         _log(f"[bibcite] {path} does not exist")
         return EXIT_ISSUES
     result = _upgrade_entries(path, args.dry_run)
+    tidied = False
     if result["upgraded"] and not args.no_tidy:
-        bibfile.run_tidy(path)
-    _emit({**result, "dry_run": args.dry_run})
+        tidied = bibfile.run_tidy(path)
+    _emit({**result, "dry_run": args.dry_run, "tidied": tidied})
+    if result["upgraded"] and not args.no_tidy and not tidied:
+        return EXIT_ISSUES
     return 0
 
 
@@ -476,7 +481,11 @@ def cmd_remove(args) -> int:
             "tidied": tidied,
         }
     )
-    return 0 if removed else EXIT_NOT_FOUND
+    if not removed:
+        return EXIT_NOT_FOUND
+    if not args.no_tidy and not tidied:
+        return EXIT_ISSUES
+    return 0
 
 
 def cmd_fix(args) -> int:

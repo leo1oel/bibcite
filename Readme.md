@@ -79,17 +79,12 @@ Running the same command again is safe: `bibcite` detects the existing entry and
 
 When `add` writes a new entry, it runs [bibtex-tidy](https://github.com/FlamingTempura/bibtex-tidy) automatically unless you pass `--no-tidy`.
 It uses a globally installed `bibtex-tidy` command when available and otherwise runs it through `npx --yes bibtex-tidy`.
+`npx` downloads the formatter automatically on first use, so the agent-first setup does not require a separate `bibtex-tidy` installation.
 The JSON result reports `"tidied": true` when formatting succeeds.
 
-If neither `bibtex-tidy` nor `npx` is available, the entry is still written but the result reports `"tidied": false`.
+If neither `bibtex-tidy` nor `npx` is available, or if the formatter fails, the entry remains written but the command exits with code `1` and reports `"tidied": false`.
 An `"action": "exists"` result also reports `"tidied": false` because no file change occurred, so `add` skips the formatting pass.
 Run `bibcite tidy references.bib` or `bibcite fix references.bib` when you want to format an existing file.
-
-Installing `bibtex-tidy` globally is optional, but it avoids the `npx` startup on each write:
-
-```bash
-npm install -g bibtex-tidy
-```
 
 You can also try a one-off command without installing `bibcite`:
 
