@@ -63,6 +63,14 @@ You can also try a one-off command without installing `bibcite`:
 uvx --from bibcite-cli bibcite get "Attention is all you need"
 ```
 
+### Install the agent skill
+
+The repository includes an agent skill that teaches Codex, Claude Code, Cursor, and other compatible agents to route bibliography changes through `bibcite` safely.
+
+```bash
+npx -y skills add leo1oel/bibcite --skill bibcite --global --yes
+```
+
 ## What it handles
 
 - It accepts arXiv IDs and URLs, arXiv DOIs such as `10.48550/arXiv.1706.03762`, standard DOIs, and paper titles.
@@ -167,6 +175,21 @@ Install the checkout as an editable command while developing:
 ```bash
 uv tool install --editable .
 ```
+
+## Releasing
+
+Publishing a GitHub Release triggers `.github/workflows/publish.yml`, which verifies that the release tag matches `v<package-version>`, runs the tests and linter, builds the distributions, and uploads them to PyPI through Trusted Publishing.
+
+Configure the `bibcite-cli` project on PyPI once with this Trusted Publisher identity:
+
+| Field | Value |
+| --- | --- |
+| Owner | `leo1oel` |
+| Repository | `bibcite` |
+| Workflow | `publish.yml` |
+| Environment | `pypi` |
+
+After that setup, create a GitHub Release with a tag such as `v0.6.0` to publish the matching package version.
 
 ## License
 

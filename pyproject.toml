@@ -20,6 +20,7 @@ bibcite = "bibcite.cli:main"
 [dependency-groups]
 dev = [
     "pytest>=8",
+    "ruff>=0.15,<0.16",
 ]
 
 [build-system]
