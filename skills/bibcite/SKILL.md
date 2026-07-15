@@ -9,17 +9,7 @@ compatibility: Requires bibcite or uv, network access for paper resolution, and 
 Route every `.bib` change through `bibcite` because the CLI resolves metadata, canonicalizes venues, deduplicates entries, preserves existing citation keys, and formats the file.
 Never add, replace, or delete a `.bib` entry by editing the file directly.
 
-## Ensure the CLI is available
-
-Check whether `bibcite` is on `PATH` before the first bibliography command.
-If it is missing, install it once with `uv tool install bibcite-cli`, then use the `bibcite` command normally for the rest of the task.
-A persistent tool installation avoids resolving and creating an isolated environment on every invocation.
-Verify the installation with `bibcite --help`.
-If uv reports that its tool directory is not on `PATH`, locate the installed command with `uv tool dir --bin` and invoke that `bibcite` executable by its absolute path for the current task.
-Do not edit the user's shell startup files automatically; mention `uv tool update-shell` if they want the command added to future shells.
-
-If the environment is temporary, read-only, or does not allow a persistent tool installation, use `uvx --from bibcite-cli bibcite <subcommand>` as the fallback.
-Do not upgrade or reinstall an existing `bibcite` command unless the user asks for an upgrade.
+If `bibcite` is not on `PATH`, install it with `uv tool install bibcite-cli`, then use the commands below.
 
 ## Choose the command
 
@@ -51,12 +41,9 @@ File-changing commands print a JSON result on standard output and diagnostics on
 Read the `key` from JSON after `add` and use that exact value in `\cite{...}` instead of guessing or reconstructing it.
 After a write, confirm that `tidied` is `true` before reporting that formatting completed.
 An `exists` result may have `tidied` set to `false` because the file was unchanged, so `add` skipped the formatting pass.
-For any other result with `tidied` set to `false`, the command should exit with code `1` after trying both a global `bibtex-tidy` command and automatic download through `npx`.
-Run `bibcite tidy <file>` once to retry a transient formatter failure.
-Do not install `bibtex-tidy` separately because `bibcite` downloads it through `npx` when needed.
-If formatting still fails because Node.js or `npx` is missing, explain the dependency and ask before installing Node.js because that changes the user's system environment.
-After the user approves that installation, follow the environment's existing package-manager conventions, then rerun `bibcite tidy <file>`.
-Never format the file by hand as a fallback.
+For any other `tidied: false` result, expect exit code `1` and retry once with `bibcite tidy <file>`.
+`bibcite` downloads `bibtex-tidy` through `npx`, so do not install it separately.
+If Node.js or `npx` is missing, ask before installing it and never format the file by hand.
 
 Treat these `action` values as successful outcomes:
 
