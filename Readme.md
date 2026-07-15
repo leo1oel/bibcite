@@ -25,14 +25,11 @@ Install the bundled skill so your coding agent knows how to manage citations wit
 npx -y skills add leo1oel/bibcite --skill bibcite --global --yes
 ```
 
-Install the CLI once as well, or let the agent do this on its first bibliography task:
+Install the CLI once as well, or let the agent install it on the first bibliography task:
 
 ```bash
 uv tool install bibcite-cli
 ```
-
-When the command is missing, the skill installs it with `uv tool install bibcite-cli` before managing the bibliography.
-It falls back to `uvx --from bibcite-cli bibcite` only in temporary or read-only environments that do not allow a persistent tool installation.
 
 You can then ask your agent to handle the bibliography in plain language:
 
@@ -197,21 +194,6 @@ Install the checkout as an editable command while developing:
 ```bash
 uv tool install --editable .
 ```
-
-## Releasing
-
-Publishing a GitHub Release triggers `.github/workflows/publish.yml`, which verifies that the release tag matches `v<package-version>`, runs the tests and linter, builds the distributions, and uploads them to PyPI through Trusted Publishing.
-
-The `bibcite-cli` project uses this Trusted Publisher identity:
-
-| Field | Value |
-| --- | --- |
-| Owner | `leo1oel` |
-| Repository | `bibcite` |
-| Workflow | `publish.yml` |
-| Environment | `pypi` |
-
-Create a GitHub Release with a tag such as `v0.6.0` to publish the matching package version.
 
 ## License
 
