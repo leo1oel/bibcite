@@ -17,6 +17,14 @@ from .normalize import (
     fix_pages,
     make_key,
 )
+from .sources import (
+    ArxivMeta,
+    Match,
+    arxiv_metadata,
+    crossref_by_doi,
+    find_published,
+)
+from .venues import canonicalize
 
 
 class NotFound(Exception):
@@ -27,14 +35,6 @@ class NotFound(Exception):
 class SourcesUnavailable(Exception):
     """Resolution failed because sources were down/rate-limited, NOT because
     the paper doesn't exist. Retrying later is the right next step."""
-from .sources import (
-    ArxivMeta,
-    Match,
-    arxiv_metadata,
-    crossref_by_doi,
-    find_published,
-)
-from .venues import canonicalize
 
 ARXIV_NEW = re.compile(r"^(?:arxiv:)?(\d{4}\.\d{4,5})(v\d+)?$", re.I)
 ARXIV_OLD = re.compile(r"^(?:arxiv:)?([a-z-]+(?:\.[A-Z]{2})?/\d{7})(v\d+)?$", re.I)
@@ -44,6 +44,12 @@ ARXIV_URL = re.compile(
 )
 DOI_URL = re.compile(r"doi\.org/(10\.\S+)", re.I)
 DOI_RE = re.compile(r"^10\.\d{4,9}/\S+$")
+ARXIV_DOI = re.compile(
+    r"^10\.48550/arxiv\."
+    r"(\d{4}\.\d{4,5}|[a-z-]+(?:\.[A-Z]{2})?/\d{7})"
+    r"(?:v\d+)?$",
+    re.I,
+)
 
 
 def _log(msg: str):
@@ -60,7 +66,12 @@ def classify(query: str) -> tuple[str, str]:
         return "arxiv", m.group(1)
     m = DOI_URL.search(q)
     if m:
-        return "doi", m.group(1)
+        doi = m.group(1)
+        arxiv = ARXIV_DOI.match(doi)
+        return ("arxiv", arxiv.group(1)) if arxiv else ("doi", doi)
+    m = ARXIV_DOI.match(q)
+    if m:
+        return "arxiv", m.group(1)
     if DOI_RE.match(q):
         return "doi", q
     return "title", query.strip()

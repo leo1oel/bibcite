@@ -26,10 +26,12 @@ from .venues import canonicalize
 
 # Exit codes (part of the agent-facing contract):
 #   0 success
+#   1 file, lint, or formatting problem remains
 #   2 the paper could not be resolved — ask for a stronger identifier
 #   3 internal/network failure (sources down, unexpected error) — retry later
 EXIT_NOT_FOUND = 2
 EXIT_INTERNAL = 3
+EXIT_ISSUES = 1
 
 
 def _log(msg: str):
@@ -379,6 +381,9 @@ def cmd_upgrade(args) -> int:
     path = Path(args.file)
     if args.no_cache:
         cache.DISABLED = True
+    if not path.exists():
+        _log(f"[bibcite] {path} does not exist")
+        return EXIT_ISSUES
     result = _upgrade_entries(path, args.dry_run)
     if result["upgraded"] and not args.no_tidy:
         bibfile.run_tidy(path)
@@ -442,13 +447,17 @@ def _check_problems(path: Path) -> tuple[int, list] | None:
 
 
 def cmd_check(args) -> int:
-    checked = _check_problems(Path(args.file))
+    path = Path(args.file)
+    if not path.exists():
+        _log(f"[bibcite] {path} does not exist")
+        return EXIT_ISSUES
+    checked = _check_problems(path)
     if checked is None:
         _log(f"[bibcite] {args.file} could not be parsed")
-        return 1
+        return EXIT_ISSUES
     entries, problems = checked
     _emit({"entries": entries, "problems": problems})
-    return 0
+    return EXIT_ISSUES if problems else 0
 
 
 def cmd_remove(args) -> int:
@@ -477,7 +486,7 @@ def cmd_fix(args) -> int:
         cache.DISABLED = True
     if not path.exists():
         _log(f"[bibcite] {path} does not exist")
-        return 1
+        return EXIT_ISSUES
     result = _upgrade_entries(path, dry_run=False)
     tidied = bibfile.run_tidy(path)
     checked = _check_problems(path)
@@ -490,7 +499,7 @@ def cmd_fix(args) -> int:
             "remaining_problems": problems,
         }
     )
-    return 0
+    return EXIT_ISSUES if not tidied or checked is None or problems else 0
 
 
 # ---------------------------------------------------------------------------

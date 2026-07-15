@@ -5,6 +5,7 @@ from pathlib import Path
 from bibcite import cache
 from bibcite.bibfile import parse_bibtex_entry, remove_entry, upsert_entry
 from bibcite.normalize import fix_author_caps
+from bibcite.resolve import classify
 
 # CrossRef's transform endpoint emits bare month macros (month=June) that are
 # not in bibtexparser's common_strings — this used to KeyError('june').
@@ -89,3 +90,15 @@ def test_cache_disabled(tmp_path, monkeypatch):
     monkeypatch.setattr(cache, "DISABLED", True)
     cache.put("k", {"venue": "X"})
     assert cache.get("k") is None
+
+
+def test_arxiv_doi_classifies_as_arxiv_id():
+    assert classify("10.48550/arXiv.1706.03762") == ("arxiv", "1706.03762")
+    assert classify("https://doi.org/10.48550/arXiv.1706.03762") == (
+        "arxiv",
+        "1706.03762",
+    )
+    assert classify("10.48550/arXiv.hep-th/9901001") == (
+        "arxiv",
+        "hep-th/9901001",
+    )
