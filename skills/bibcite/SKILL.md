@@ -1,7 +1,7 @@
 ---
 name: bibcite
 description: Manage paper citations and .bib files through the bibcite CLI instead of hand-editing them. Use whenever a task involves adding a paper reference or \cite, resolving an arXiv ID, arXiv DOI, DOI, or title to BibTeX, cleaning or checking a bibliography, deduplicating entries, or upgrading arXiv preprints to published records.
-compatibility: Requires the bibcite command or uvx, plus network access for paper resolution.
+compatibility: Requires the bibcite command or uvx, network access for paper resolution, and bibtex-tidy or npx for formatting.
 ---
 
 # bibcite
@@ -39,6 +39,11 @@ Use `fix` when the user asks to clean up a bibliography end to end.
 
 File-changing commands print a JSON result on standard output and diagnostics on standard error.
 Read the `key` from JSON after `add` and use that exact value in `\cite{...}` instead of guessing or reconstructing it.
+After a write, confirm that `tidied` is `true` before reporting that formatting completed.
+An `exists` result may have `tidied` set to `false` because the file was unchanged, so `add` skipped the formatting pass.
+For any other result with `tidied` set to `false`, the command should exit with code `1` after trying both a global `bibtex-tidy` command and automatic download through `npx`.
+Run `bibcite tidy <file>` once to retry a transient formatter failure.
+If formatting still fails, report that Node.js with `npx` is required instead of formatting the file by hand.
 
 Treat these `action` values as successful outcomes:
 
