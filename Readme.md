@@ -25,13 +25,14 @@ Install the bundled skill so your coding agent knows how to manage citations wit
 npx -y skills add leo1oel/bibcite --skill bibcite --global --yes
 ```
 
-For faster repeated use, install the CLI once as well:
+Install the CLI once as well, or let the agent do this on its first bibliography task:
 
 ```bash
 uv tool install bibcite-cli
 ```
 
-If the command is not installed, the skill can run it through `uvx --from bibcite-cli bibcite` instead.
+When the command is missing, the skill installs it with `uv tool install bibcite-cli` before managing the bibliography.
+It falls back to `uvx --from bibcite-cli bibcite` only in temporary or read-only environments that do not allow a persistent tool installation.
 
 You can then ask your agent to handle the bibliography in plain language:
 
