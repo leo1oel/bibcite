@@ -12,6 +12,7 @@ import re
 import sys
 import time
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
 import httpx
@@ -23,7 +24,12 @@ BROWSER_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
-TIMEOUT = 20.0
+# Per-request cap for the publication-matching sources. Kept short so one slow
+# or half-down source (DBLP in particular) can't stall an interactive resolve;
+# a source that can't answer in time is treated as unavailable → "incomplete",
+# never a false "not published". The arXiv metadata fetch sets its own longer
+# timeout on the request itself, so this does not affect it.
+TIMEOUT = 8.0
 
 PREPRINT_VENUES = re.compile(r"arxiv|corr|biorxiv|medrxiv|chemrxiv|ssrn|preprint", re.I)
 ARXIV_DOI = re.compile(r"^10\.48550/", re.I)
@@ -183,30 +189,32 @@ def _paced_get(
     params: dict | None = None,
     headers: dict | None = None,
 ) -> httpx.Response:
-    for attempt in range(3):
+    for attempt in range(2):
         wait = min_interval - (time.monotonic() - _LAST_REQUEST.get(source, 0.0))
         if wait > 0:
             time.sleep(wait)
         _LAST_REQUEST[source] = time.monotonic()
         try:
             r = c.get(url, params=params, headers=headers)
-        except httpx.HTTPError as e:  # Retry transport errors before failing this entry.
-            if attempt < 2:
-                time.sleep(5 * (attempt + 1))
+        except httpx.HTTPError as e:  # Retry transport errors once before failing.
+            if attempt < 1:
+                time.sleep(1)
                 continue
             raise TransientSourceError(
                 f"{source} unreachable ({type(e).__name__})"
             ) from e
         if r.status_code == 429:
+            # A 429 is usually a persistent rate-limit (e.g. the shared
+            # unauthenticated Semantic Scholar pool), not a transient blip, so a
+            # long client-side backoff rarely clears it and just stalls an
+            # interactive resolve. Take at most one quick retry when the server
+            # asks for a short wait, then give up and let the circuit breaker
+            # skip this source for the rest of the run.
             retry_after = int(r.headers.get("Retry-After") or 0)
-            if retry_after > 30:
-                raise SourceUnavailable(f"{source} rate-limited (Retry-After {retry_after}s)")
-            if attempt < 2:
-                delay = max(retry_after, 4 * (attempt + 1))
-                _log(f"[{source}] 429 — backing off {delay}s")
-                time.sleep(delay)
+            if attempt < 1 and retry_after <= 2:
+                time.sleep(max(retry_after, 1))
                 continue
-            raise SourceUnavailable(f"{source} rate-limited (429) after backoff retries")
+            raise SourceUnavailable(f"{source} rate-limited (429)")
         return r
     raise SourceUnavailable(f"{source} unavailable")
 
@@ -795,32 +803,51 @@ def find_published(
         _log(f"[cache] hit: {cached.get('venue', '')} ({cached.get('source', '')})")
         return Match(**cached), "found"
 
-    clean_misses = 0
     # Core sources lost earlier in this run taint this query's verdict too.
     incomplete = any(n in CORE_SOURCES for n in _DISABLED)
-    for name, fn in CASCADE:
-        if name in _DISABLED:
-            continue
-        try:
-            m = fn(title, year, arxiv_id, author_hint)
-            if m:
-                cache.put(cache_key, m.__dict__)
-                return m, "found"
-            clean_misses += 1
-            _log(f"[{name}] no publication found")
-        except TransientSourceError as e:
-            incomplete = incomplete or name in CORE_SOURCES
-            _log(
-                f"[{name}] transient failure for this entry; "
-                f"will retry on the next: {e}"
-            )
-        except SourceUnavailable as e:
-            _DISABLED[name] = str(e)
-            incomplete = incomplete or name in CORE_SOURCES
-            _log(f"[{name}] disabled for the rest of this run: {e}")
-        except Exception as e:  # network hiccup on one source must not kill the run
-            incomplete = incomplete or name in CORE_SOURCES
-            _log(f"[{name}] error: {type(e).__name__}: {e}")
+    # Query every still-viable source concurrently. A preprint with no published
+    # version (the common case) misses everywhere, and used to pay the *sum* of
+    # each source's latency; now the wall-clock is the slowest single source.
+    # The first verified hit by CASCADE priority still wins.
+    active = [(name, fn) for name, fn in CASCADE if name not in _DISABLED]
+    outcomes: dict[str, tuple] = {}
+    if active:
+        with ThreadPoolExecutor(max_workers=len(active)) as pool:
+            futures = {
+                pool.submit(fn, title, year, arxiv_id, author_hint): name
+                for name, fn in active
+            }
+            for future in as_completed(futures):
+                name = futures[future]
+                try:
+                    m = future.result()
+                    if m:
+                        outcomes[name] = ("found", m)
+                    else:
+                        outcomes[name] = ("miss", None)
+                        _log(f"[{name}] no publication found")
+                except TransientSourceError as e:
+                    outcomes[name] = ("fail", name in CORE_SOURCES)
+                    _log(f"[{name}] transient failure for this entry: {e}")
+                except SourceUnavailable as e:
+                    _DISABLED[name] = str(e)
+                    outcomes[name] = ("fail", name in CORE_SOURCES)
+                    _log(f"[{name}] disabled for the rest of this run: {e}")
+                except Exception as e:  # a hiccup on one source must not kill the run
+                    outcomes[name] = ("fail", name in CORE_SOURCES)
+                    _log(f"[{name}] error: {type(e).__name__}: {e}")
+
+    # Prefer the highest-priority source that verified a match.
+    for name, _ in CASCADE:
+        outcome = outcomes.get(name)
+        if outcome and outcome[0] == "found":
+            cache.put(cache_key, outcome[1].__dict__)
+            return outcome[1], "found"
+
+    clean_misses = sum(1 for outcome in outcomes.values() if outcome[0] == "miss")
+    incomplete = incomplete or any(
+        outcome[0] == "fail" and outcome[1] for outcome in outcomes.values()
+    )
 
     # Exact-title search missed everywhere. Before concluding "no published
     # version", try the title-drift fallback — camera-ready titles frequently
