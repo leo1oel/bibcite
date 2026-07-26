@@ -43,6 +43,12 @@ class SourceUnavailable(Exception):
     """Raised when a source rate-limits/blocks us; the cascade skips it."""
 
 
+class PageUnreadable(Exception):
+    """A page refused to be read and will refuse again — a different
+    identifier, or a hand-written entry, is the next step rather than a
+    retry."""
+
+
 class TransientSourceError(SourceUnavailable):
     """Raised after request retries are exhausted without tripping the
     process-wide circuit breaker for later batch entries."""
@@ -871,3 +877,136 @@ def find_published(
     if not clean_misses:
         return None, "unavailable"
     return None, ("incomplete" if incomplete else "not_found")
+
+
+@dataclass
+class WebPage:
+    """What a web page can say about itself, for citing it as an @misc."""
+
+    url: str
+    title: str
+    authors: list[str] = field(default_factory=list)
+    year: str = ""
+    site: str = ""
+
+
+def _meta_content(html_text: str, *keys: str) -> str:
+    """The content of the first <meta> whose name/property matches a key.
+
+    Attribute order varies between generators, so both orders are tried rather
+    than assuming content comes last.
+    """
+    for key in keys:
+        for pattern in (
+            rf'<meta[^>]+(?:name|property)=["\']{re.escape(key)}["\'][^>]*'
+            rf'content=["\'](.*?)["\']',
+            rf'<meta[^>]+content=["\'](.*?)["\'][^>]*'
+            rf'(?:name|property)=["\']{re.escape(key)}["\']',
+        ):
+            m = re.search(pattern, html_text, re.I | re.S)
+            if m and m.group(1).strip():
+                return html.unescape(m.group(1).strip())
+    return ""
+
+
+def fetch_web_page(url: str) -> WebPage:
+    """Read a page's own description of itself.
+
+    Blogs, documentation and standards pages are cited constantly and are in
+    none of the academic indexes, so there is nothing to look them up in — the
+    page itself is the only source. Highwire and Dublin Core tags come first
+    because sites that carry them mean them; Open Graph and <title> are the
+    fallback every site has.
+    """
+    try:
+        with _client(browser=True) as client:
+            response = client.get(url)
+            response.raise_for_status()
+            body = response.text[:400_000]
+    except httpx.HTTPStatusError as e:
+        status = e.response.status_code
+        # 403 and 404 are settled answers: the page will not become readable on
+        # a retry, so say so rather than sending the caller back to wait.
+        if status in (401, 403, 404, 410) or 400 <= status < 500:
+            raise PageUnreadable(
+                f"the page answered {status} — cite it with --bibtex, or use its DOI if it has one"
+            ) from e
+        raise SourceUnavailable(f"could not fetch {url}: {e}") from e
+    except httpx.HTTPError as e:
+        raise SourceUnavailable(f"could not fetch {url}: {e}") from e
+
+    title = (
+        _meta_content(body, "citation_title", "DC.title", "og:title", "twitter:title")
+        or _title_tag(body)
+    )
+    authors = [
+        author
+        for author in (
+            _meta_content(body, "citation_author", "DC.creator", "author", "article:author"),
+        )
+        if author
+    ]
+    date = _meta_content(
+        body,
+        "citation_publication_date",
+        "citation_date",
+        "DC.date",
+        "article:published_time",
+        "og:updated_time",
+        "date",
+    )
+    year = _year_in(date) or _year_in_path(url)
+    site = _meta_content(body, "og:site_name") or _site_author(_host(url))
+    return WebPage(url=str(response.url), title=title, authors=authors, year=year, site=site)
+
+
+def _year_in(text: str) -> str:
+    m = re.search(r"(?:19|20)\d{2}", text)
+    return m.group(0) if m else ""
+
+
+def _year_in_path(url: str) -> str:
+    """The year a dateless page puts in its own URL.
+
+    Blog engines write `/2015/05/21/title`, and a citation key of
+    `karpathyXXXXunreasonable` is worse than one carrying the year the post
+    announces about itself. Only the path is read: a query string can hold any
+    number at all.
+    """
+    path = re.sub(r"^https?://[^/]+", "", url).split("?")[0].split("#")[0]
+    for segment in path.split("/"):
+        if re.fullmatch(r"(?:19|20)\d{2}", segment):
+            return segment
+    return ""
+
+
+def _title_tag(html_text: str) -> str:
+    m = re.search(r"<title[^>]*>(.*?)</title>", html_text, re.I | re.S)
+    if not m:
+        return ""
+    # Strip the trailing " — Site Name" many templates append; the site name is
+    # recorded separately, and repeating it in the title reads badly in a
+    # bibliography.
+    title = html.unescape(re.sub(r"\s+", " ", m.group(1))).strip()
+    return re.sub(r"\s*[|·—–-]\s*[^|·—–-]{1,40}$", "", title).strip() or title
+
+
+def _host(url: str) -> str:
+    m = re.match(r"https?://(?:www\.)?([^/:]+)", url, re.I)
+    return m.group(1) if m else ""
+
+
+def _site_author(host: str) -> str:
+    """A readable stand-in author for a page with no byline.
+
+    The bare host makes an unreadable key — `karpathygithubioXXXXunreasonable`
+    — so the hosting suffix goes and the name that identifies the site stays:
+    `karpathy.github.io` reads as Karpathy, `docs.python.org` as Python.
+    """
+    labels = [label for label in host.lower().split(".") if label]
+    if not labels:
+        return host
+    generic = {"github", "io", "com", "org", "net", "edu", "gov", "ai", "dev",
+               "co", "uk", "cn", "blog", "www", "docs", "pages", "medium"}
+    named = [label for label in labels if label not in generic]
+    return (named[0] if named else labels[0]).capitalize()

@@ -5,7 +5,7 @@
 <h1 align="center">bibcite</h1>
 
 <p align="center">
-  Turn an arXiv ID, DOI, or paper title into clean BibTeX, then keep the whole bibliography normalized and deduplicated.
+  Turn an arXiv ID, DOI, paper title, or web page into clean BibTeX, then keep the whole bibliography normalized and deduplicated.
 </p>
 
 <p align="center">
@@ -92,7 +92,8 @@ uvx --from bibcite-cli bibcite get "Attention is all you need"
 
 ## What it handles
 
-- It accepts arXiv IDs and URLs, arXiv DOIs such as `10.48550/arXiv.1706.03762`, standard DOIs, and paper titles.
+- It accepts arXiv IDs and URLs, arXiv DOIs such as `10.48550/arXiv.1706.03762`, standard DOIs, paper titles, and the URL of a web page.
+- A web page is cited from what the page says about itself, because no index carries blog posts, documentation, or standards. The entry is `@misc` with `howpublished = {\url{...}}`, which every conference `.bst` prints; `@online` is biblatex-only and would be dropped. A page with no byline is attributed to its site, and a page with no date takes the year from its own URL when it has one there.
 - It searches for a published version before falling back to an arXiv preprint, and it reports when source outages make that check incomplete.
 - It canonicalizes journal, conference, and workshop names against the bundled venue table, including year-sensitive names such as NIPS and NeurIPS.
 - It assigns the correct BibTeX entry type and field, such as `@inproceedings` with `booktitle` or `@article` with `journal`.

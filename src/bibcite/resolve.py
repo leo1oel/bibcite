@@ -22,6 +22,9 @@ from .sources import (
     Match,
     arxiv_metadata,
     crossref_by_doi,
+    PageUnreadable,
+    WebPage,
+    fetch_web_page,
     find_published,
 )
 from .venues import canonicalize
@@ -43,6 +46,7 @@ ARXIV_URL = re.compile(
     re.I,
 )
 DOI_URL = re.compile(r"doi\.org/(10\.\S+)", re.I)
+WEB_URL = re.compile(r"^https?://\S+$", re.I)
 DOI_RE = re.compile(r"^10\.\d{4,9}/\S+$")
 ARXIV_DOI = re.compile(
     r"^10\.48550/arxiv\."
@@ -74,6 +78,12 @@ def classify(query: str) -> tuple[str, str]:
         return "arxiv", m.group(1)
     if DOI_RE.match(q):
         return "doi", q
+    # A URL that is not arXiv and not a DOI is a page: a blog post, a standard,
+    # a documentation page. Nothing indexes those, so searching for it as a
+    # title only ever returns "no match anywhere" — the page itself is the
+    # source.
+    if WEB_URL.match(q):
+        return "webpage", q
     return "title", query.strip()
 
 
@@ -198,6 +208,31 @@ def _arxiv_only_entry(meta: ArxivMeta) -> dict:
     }
 
 
+def _web_entry(page: WebPage) -> dict:
+    """A page cited as @misc, the one type every conference .bst understands.
+
+    @online is biblatex-only; a NeurIPS or IEEE style would drop the entry
+    entirely. howpublished carries the link for the same reason the arXiv
+    preprint entry uses it: classic styles print it and ignore `url`. No access
+    date, because the tidy step omits `note` from every entry in the file.
+    """
+    entry = {
+        "ENTRYTYPE": "misc",
+        "title": page.title,
+        "howpublished": f"\\url{{{page.url}}}",
+        "url": page.url,
+    }
+    if page.authors:
+        entry["author"] = " and ".join(page.authors)
+    elif page.site:
+        # No byline: the site is the closest thing to a corporate author, and a
+        # key of `anonymousXXXX…` is worse than one naming where it came from.
+        entry["author"] = f"{{{page.site}}}"
+    if page.year:
+        entry["year"] = page.year
+    return entry
+
+
 def resolve(query: str, require_published: bool = False) -> Resolved:
     kind, value = classify(query)
     _log(f"[bibcite] query understood as {kind}: {value}")
@@ -247,6 +282,16 @@ def resolve(query: str, require_published: bool = False) -> Resolved:
             _log("[bibcite] no published version found; using arXiv preprint entry")
         entry = _arxiv_only_entry(meta)
         return Resolved(_finalize(entry, meta), "arxiv", "", False, check)
+
+    if kind == "webpage":
+        try:
+            page = fetch_web_page(value)
+        except PageUnreadable as e:
+            raise NotFound(f"could not read {value}: {e}") from e
+        if not page.title:
+            raise NotFound(f"No title found on the page: {value}")
+        _log(f"[web] {page.title}" + (f" ({page.year})" if page.year else ""))
+        return Resolved(_finalize(_web_entry(page), None), "webpage", page.site, False)
 
     if kind == "doi":
         match = crossref_by_doi(value)
