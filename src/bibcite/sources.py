@@ -10,6 +10,7 @@ import html
 import os
 import re
 import sys
+import threading
 import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -30,6 +31,10 @@ BROWSER_UA = (
 # never a false "not published". The arXiv metadata fetch sets its own longer
 # timeout on the request itself, so this does not affect it.
 TIMEOUT = 8.0
+# Publication matching is enrichment on top of a valid arXiv citation. Keep
+# the entire concurrent cascade, including its DBLP title-drift fallback,
+# within an interactive budget instead of letting sequential retries add up.
+PUBLICATION_TIMEOUT = 10.0
 
 PREPRINT_VENUES = re.compile(r"arxiv|corr|biorxiv|medrxiv|chemrxiv|ssrn|preprint", re.I)
 ARXIV_DOI = re.compile(r"^10\.48550/", re.I)
@@ -52,6 +57,56 @@ class PageUnreadable(Exception):
 class TransientSourceError(SourceUnavailable):
     """Raised after request retries are exhausted without tripping the
     process-wide circuit breaker for later batch entries."""
+
+
+class PublicationTimeout(TransientSourceError):
+    """The total publication-matching budget was exhausted."""
+
+
+_REQUEST_DEADLINE = threading.local()
+
+
+def _request_timeout(cap: float = TIMEOUT) -> float:
+    deadline = getattr(_REQUEST_DEADLINE, "value", None)
+    if deadline is None:
+        return cap
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise PublicationTimeout("publication lookup timed out")
+    return max(0.001, min(cap, remaining))
+
+
+def _get(
+    c: httpx.Client, url: str, *, timeout: float = TIMEOUT, **kwargs
+) -> httpx.Response:
+    """GET with the per-request cap narrowed by the active total deadline."""
+    return c.get(url, timeout=_request_timeout(timeout), **kwargs)
+
+
+def _sleep(delay: float):
+    """Sleep for pacing/backoff without crossing the publication deadline."""
+    deadline = getattr(_REQUEST_DEADLINE, "value", None)
+    if deadline is None:
+        time.sleep(delay)
+        return
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise PublicationTimeout("publication lookup timed out")
+    time.sleep(min(delay, remaining))
+    if delay >= remaining:
+        raise PublicationTimeout("publication lookup timed out")
+
+
+def _with_deadline(deadline: float, fn, *args):
+    previous = getattr(_REQUEST_DEADLINE, "value", None)
+    _REQUEST_DEADLINE.value = deadline
+    try:
+        return fn(*args)
+    finally:
+        if previous is None:
+            del _REQUEST_DEADLINE.value
+        else:
+            _REQUEST_DEADLINE.value = previous
 
 
 def _client(browser: bool = False) -> httpx.Client:
@@ -129,7 +184,8 @@ def arxiv_api_get(params: dict) -> httpx.Response:
             time.sleep(3 * attempt)
         try:
             with _client() as c:
-                r = c.get(
+                r = _get(
+                    c,
                     "https://export.arxiv.org/api/query",
                     params=params,
                     timeout=30.0,
@@ -198,13 +254,13 @@ def _paced_get(
     for attempt in range(2):
         wait = min_interval - (time.monotonic() - _LAST_REQUEST.get(source, 0.0))
         if wait > 0:
-            time.sleep(wait)
+            _sleep(wait)
         _LAST_REQUEST[source] = time.monotonic()
         try:
-            r = c.get(url, params=params, headers=headers)
+            r = _get(c, url, params=params, headers=headers)
         except httpx.HTTPError as e:  # Retry transport errors once before failing.
             if attempt < 1:
-                time.sleep(1)
+                _sleep(1)
                 continue
             raise TransientSourceError(
                 f"{source} unreachable ({type(e).__name__})"
@@ -218,7 +274,7 @@ def _paced_get(
             # skip this source for the rest of the run.
             retry_after = int(r.headers.get("Retry-After") or 0)
             if attempt < 1 and retry_after <= 2:
-                time.sleep(max(retry_after, 1))
+                _sleep(max(retry_after, 1))
                 continue
             raise SourceUnavailable(f"{source} rate-limited (429)")
         return r
@@ -398,7 +454,7 @@ def arxiv_abs_metadata(arxiv_id: str) -> ArxivMeta | None:
     """Scrape the arxiv.org abs page's Highwire meta tags — the abs pages stay
     up when the export API throttles."""
     with _client(browser=True) as c:
-        r = c.get(f"https://arxiv.org/abs/{arxiv_id}")
+        r = _get(c, f"https://arxiv.org/abs/{arxiv_id}")
         if r.status_code != 200:
             return None
         page = r.text
@@ -489,7 +545,8 @@ def try_semantic_scholar(
 
 def try_google_scholar(title: str) -> Match | None:
     with _client(browser=True) as c:
-        r = c.get(
+        r = _get(
+            c,
             "https://scholar.google.com/scholar",
             params={"q": title, "hl": "en"},
         )
@@ -516,12 +573,12 @@ def try_google_scholar(title: str) -> Match | None:
             "https://scholar.google.com/scholar?q=info:"
             f"{data_id}:scholar.google.com/&output=cite&scirp=0&hl=en"
         )
-        cite_html = c.get(cite_url).text
+        cite_html = _get(c, cite_url).text
         bm = re.search(r'<a[^>]*href="([^">]+)"[^>]*>BibTex</a>', cite_html, re.I)
         if not bm:
             return None
         bib_url = re.sub(r"\s+", "", bm.group(1).replace("&amp;", "&"))
-        bibtex = c.get(bib_url).text
+        bibtex = _get(c, bib_url).text
     from .bibfile import parse_bibtex_entry  # local import to avoid cycle
 
     entry = parse_bibtex_entry(bibtex)
@@ -544,7 +601,8 @@ def try_google_scholar(title: str) -> Match | None:
 
 def try_crossref(title: str) -> Match | None:
     with _client() as c:
-        r = c.get(
+        r = _get(
+            c,
             "https://api.crossref.org/works",
             params={
                 "rows": 3,
@@ -583,8 +641,9 @@ def try_crossref(title: str) -> Match | None:
                 year = str(parts[0][0])
             bibtex = ""
             if doi:
-                br = c.get(
-                    f"https://api.crossref.org/works/{doi}/transform/application/x-bibtex"
+                br = _get(
+                    c,
+                    f"https://api.crossref.org/works/{doi}/transform/application/x-bibtex",
                 )
                 if br.status_code == 200:
                     bibtex = br.text
@@ -606,7 +665,8 @@ def try_crossref(title: str) -> Match | None:
 
 def try_unpaywall(title: str) -> Match | None:
     with _client() as c:
-        r = c.get(
+        r = _get(
+            c,
             "https://api.unpaywall.org/v2/search",
             params={"query": title, "is_oa": "true", "email": _mailto()},
         )
@@ -653,7 +713,8 @@ def try_unpaywall(title: str) -> Match | None:
 def openalex_search(title: str) -> dict | None:
     """OpenAlex work with an exactly-matching normalized title, or None."""
     with _client() as c:
-        r = c.get(
+        r = _get(
+            c,
             "https://api.openalex.org/works",
             params=_openalex_params({"search": title, "per-page": 5}),
         )
@@ -725,7 +786,9 @@ def try_openalex(title: str) -> Match | None:
 
 def crossref_by_doi(doi: str) -> Match | None:
     with _client() as c:
-        r = c.get(f"https://api.crossref.org/works/{doi}", params={"mailto": _mailto()})
+        r = _get(
+            c, f"https://api.crossref.org/works/{doi}", params={"mailto": _mailto()}
+        )
         if r.status_code != 200:
             return None
         data = r.json().get("message", {})
@@ -737,7 +800,9 @@ def crossref_by_doi(doi: str) -> Match | None:
         if parts and parts[0]:
             year = str(parts[0][0])
         bibtex = ""
-        br = c.get(f"https://api.crossref.org/works/{doi}/transform/application/x-bibtex")
+        br = _get(
+            c, f"https://api.crossref.org/works/{doi}/transform/application/x-bibtex"
+        )
         if br.status_code == 200:
             bibtex = br.text
         authors = [
@@ -815,12 +880,21 @@ def find_published(
     # version (the common case) misses everywhere, and used to pay the *sum* of
     # each source's latency; now the wall-clock is the slowest single source.
     # The first verified hit by CASCADE priority still wins.
+    deadline = time.monotonic() + PUBLICATION_TIMEOUT
     active = [(name, fn) for name, fn in CASCADE if name not in _DISABLED]
     outcomes: dict[str, tuple] = {}
     if active:
         with ThreadPoolExecutor(max_workers=len(active)) as pool:
             futures = {
-                pool.submit(fn, title, year, arxiv_id, author_hint): name
+                pool.submit(
+                    _with_deadline,
+                    deadline,
+                    fn,
+                    title,
+                    year,
+                    arxiv_id,
+                    author_hint,
+                ): name
                 for name, fn in active
             }
             for future in as_completed(futures):
@@ -858,9 +932,18 @@ def find_published(
     # Exact-title search missed everywhere. Before concluding "no published
     # version", try the title-drift fallback — camera-ready titles frequently
     # differ from the arXiv ones, which is precisely the upgrade scenario.
-    if author_hint and "dblp" not in _DISABLED:
+    # Only a clean exact DBLP miss justifies another query. A timeout or other
+    # failure has already spent its chance for this entry, and retrying the
+    # fuzzy form was doubling the worst-case interactive latency.
+    dblp_outcome = outcomes.get("dblp")
+    if (
+        author_hint
+        and dblp_outcome is not None
+        and dblp_outcome[0] == "miss"
+        and time.monotonic() < deadline
+    ):
         try:
-            m = try_dblp_fuzzy(title, author_hint, year)
+            m = _with_deadline(deadline, try_dblp_fuzzy, title, author_hint, year)
             if m:
                 cache.put(cache_key, m.__dict__)
                 return m, "found"
@@ -920,7 +1003,7 @@ def fetch_web_page(url: str) -> WebPage:
     """
     try:
         with _client(browser=True) as client:
-            response = client.get(url)
+            response = _get(client, url)
             response.raise_for_status()
             body = response.text[:400_000]
     except httpx.HTTPStatusError as e:

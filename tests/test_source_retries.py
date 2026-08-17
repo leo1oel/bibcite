@@ -5,7 +5,12 @@ import bibcite.sources as sources
 from bibcite import cache
 from bibcite.bibfile import load_bib_file
 from bibcite.cli import _upgrade_entries
-from bibcite.sources import Match, SourceUnavailable, find_published
+from bibcite.sources import (
+    Match,
+    SourceUnavailable,
+    TransientSourceError,
+    find_published,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -22,7 +27,7 @@ class _ReadErrorClient:
         self.failures = failures
         self.calls = 0
 
-    def get(self, url, params=None, headers=None):
+    def get(self, url, params=None, headers=None, timeout=None):
         self.calls += 1
         request = httpx.Request("GET", url, params=params, headers=headers)
         if self.calls <= self.failures:
@@ -68,6 +73,41 @@ def test_dblp_read_failures_do_not_disable_later_batch_entries(monkeypatch):
     assert second_status == "found"
     assert second_match is not None
     assert second_match.venue == "TMLR"
+
+
+def test_dblp_transport_failure_skips_the_fuzzy_retry(monkeypatch):
+    fuzzy_calls = 0
+
+    def dblp(*args):
+        raise TransientSourceError("simulated timeout")
+
+    def fuzzy(*args):
+        nonlocal fuzzy_calls
+        fuzzy_calls += 1
+
+    monkeypatch.setattr(
+        sources,
+        "CASCADE",
+        (
+            ("dblp", dblp),
+            ("crossref", lambda *args: None),
+        ),
+    )
+    monkeypatch.setattr(sources, "try_dblp_fuzzy", fuzzy)
+
+    match, status = find_published("First paper", author_hint="doe")
+
+    assert (match, status) == (None, "incomplete")
+    assert fuzzy_calls == 0
+
+
+def test_requests_use_only_the_remaining_publication_budget(monkeypatch):
+    monkeypatch.setattr(sources.time, "monotonic", lambda: 7.0)
+    sources._REQUEST_DEADLINE.value = 10.0
+    try:
+        assert sources._request_timeout(8.0) == 3.0
+    finally:
+        del sources._REQUEST_DEADLINE.value
 
 
 def test_upgrade_retries_dblp_after_previous_entry_read_failures(
