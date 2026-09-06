@@ -7,6 +7,7 @@ preprint venues (arXiv / CoRR / bioRxiv / ...).
 """
 
 import html
+import json
 import os
 import re
 import sys
@@ -19,7 +20,14 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from .normalize import clean_title, mini_hash, norm_title, sig_tokens, titles_similar
+from .normalize import (
+    clean_title,
+    first_author_last_name,
+    mini_hash,
+    norm_title,
+    sig_tokens,
+    titles_similar,
+)
 
 UA = "bibcite/0.6 (https://github.com/leo1oel/bibcite)"
 BROWSER_UA = (
@@ -369,21 +377,105 @@ def _dblp_get(c: httpx.Client, url: str, params: dict | None = None) -> httpx.Re
     return response
 
 
-def _dblp_sanitize(q: str) -> str:
-    """DBLP's search parser 500s deterministically on queries containing its
-    syntax characters (':' in subtitled papers, '?' in question titles).
-    They tokenize on punctuation anyway, so replacing with spaces loses
-    nothing."""
-    return re.sub(r"[^\w\s.-]", " ", q)
+def _dblp_title_search(c: httpx.Client, title: str) -> list:
+    """Indexed title candidates, not a full-dataset regex or a retry cascade.
 
-
-def _dblp_search(c: httpx.Client, q: str, h: int = 100) -> list:
-    """Run one DBLP search while retaining the full result window."""
-    url = "https://dblp.org/search/publ/api"
-    q = _dblp_sanitize(q)
-    r = _dblp_get(c, url, params={"q": q, "format": "json", "h": h})
-    r.raise_for_status()
-    return r.json().get("result", {}).get("hits", {}).get("hit", []) or []
+    QLever's literal text index avoids the slow CompleteSearch endpoint.
+    The caller still verifies the entire normalized title and author identity.
+    Limit publications BEFORE expanding author signatures, otherwise a paper
+    with many authors can silently lose authors or crowd out the actual match.
+    """
+    tokens = sorted(
+        set(re.findall(r"[^\W_]+", title.lower())), key=lambda t: (-len(t), t)
+    )[:5]
+    if not tokens:
+        raise TransientSourceError("dblp title has no searchable words")
+    words = json.dumps(" ".join(tokens), ensure_ascii=False)
+    query = f"""PREFIX dblp: <https://dblp.org/rdf/schema#>
+PREFIX ql: <http://qlever.cs.uni-freiburg.de/builtin-functions/>
+SELECT ?publ ?subject ?predicate ?value WHERE {{
+  {{ SELECT DISTINCT ?publ ?title WHERE {{
+    ?text ql:contains-word {words} ; ql:contains-entity ?title .
+    ?publ dblp:title ?title .
+  }} ORDER BY STRLEN(STR(?title)) ?publ LIMIT 101 }}
+  ?publ dblp:hasSignature? ?subject .
+  ?subject ?predicate ?value .
+}}"""
+    response = _dblp_get(
+        c,
+        "https://sparql.dblp.org/sparql",
+        params={"query": query, "action": "sparql_json_export"},
+    )
+    response.raise_for_status()
+    # Do not turn an HTML challenge or malformed/partial response into a clean miss.
+    rows = response.json()["results"]["bindings"]
+    # Read the bounded publication/signature triples instead of joining every
+    # optional field with every author. Those joins made live queries ~5s;
+    # this indexed property path returns the same fields without a cross product.
+    records: dict[str, dict[str, dict[str, list[str]]]] = {}
+    for row in rows:
+        values = {key: value["value"] for key, value in row.items()}
+        url = values["publ"]
+        if not url.startswith("https://dblp.org/rec/"):
+            raise TransientSourceError(
+                "dblp returned an invalid publication identifier"
+            )
+        subject = records.setdefault(url, {}).setdefault(values["subject"], {})
+        subject.setdefault(values["predicate"].rsplit("#", 1)[-1], []).append(
+            values["value"]
+        )
+    kinds = {
+        "Article": "Journal Articles",
+        "Inproceedings": "Conference and Workshop Papers",
+        "Incollection": "Parts in Books or Collections",
+        "Book": "Books and Theses",
+        "Editorship": "Editorship",
+        "Informal": "Informal and Other Publications",
+        "Reference": "Parts in Books or Collections",
+    }
+    fields = {
+        "title": "title",
+        "yearOfPublication": "year",
+        "publishedIn": "venue",
+        "pagination": "pages",
+        "publishedInJournalVolume": "volume",
+        "publishedInJournalVolumeIssue": "number",
+        "publishedBy": "publisher",
+        "primaryDocumentPage": "ee",
+    }
+    hits = []
+    for url, subjects in records.items():
+        record = subjects[url]
+        info = {
+            target: record[prop][0]
+            for prop, target in fields.items()
+            if record.get(prop)
+        }
+        info.update(url=url, key=url.removeprefix("https://dblp.org/rec/"))
+        for kind in record.get("type", []):
+            if kind.rsplit("#", 1)[-1] in kinds:
+                info["type"] = kinds[kind.rsplit("#", 1)[-1]]
+        if record.get("doi"):
+            info["doi"] = record["doi"][0].removeprefix("https://doi.org/")
+        if record.get("isbn"):
+            info["isbn"] = record["isbn"][0].removeprefix("urn:isbn:")
+        if not info.get("ee") and record.get("documentPage"):
+            info["ee"] = record["documentPage"][0]
+        authors, editors = [], []
+        for signature in record.get("hasSignature", []):
+            data = subjects[signature]
+            name = data["signatureDblpName"][0]
+            ordinal = int(data["signatureOrdinal"][0])
+            target = (
+                editors
+                if any(t.endswith("#EditorSignature") for t in data.get("type", []))
+                else authors
+            )
+            target.append((ordinal, name))
+        info["authors"] = {"author": [{"text": name} for _, name in sorted(authors)]}
+        info["editor"] = " and ".join(name for _, name in sorted(editors))
+        hits.append({"info": info})
+    return hits
 
 
 def _dblp_bibtex(info: dict, venue: str) -> str:
@@ -449,30 +541,30 @@ def _dblp_match(info: dict, source: str) -> Match:
 
 
 def try_dblp(title: str, author_hint: str = "") -> Match | None:
-    """DBLP search. Generic titles ("X is all you need") drown in DBLP's
-    ranking, so when we know the first author we query with their last name
-    first, then fall back to the bare title."""
-    queries = []
-    if author_hint:
-        queries.append(f"{title} {author_hint}")
-    queries.append(title)
+    """One SPARQL title lookup; failures never start another network attempt."""
     with _client() as c:
-        for q in queries:
-            hits = _dblp_search(c, q)
-            # Earliest year first: prefer the original conference publication
-            # over later journal extensions (same heuristic as PaperMemory).
-            hits.sort(key=lambda h: int(h.get("info", {}).get("year", 9999)))
-            ref = norm_title(title)
-            for hit in hits:
-                info = hit.get("info", {})
-                if norm_title(html.unescape(info.get("title", ""))) != ref:
-                    continue
-                if info.get("venue") == "CoRR" or not info.get("venue"):
-                    continue
-                match = _dblp_match(info, "dblp")
-                venue = match.venue
-                _log(f"[dblp] match: {venue} {info.get('year', '')}")
-                return match
+        hits = _dblp_title_search(c, title)
+    # Prefer the original conference publication over later journal extensions.
+    hits.sort(key=lambda h: int(h.get("info", {}).get("year", 9999)))
+    ref = norm_title(title)
+    for hit in hits:
+        info = hit.get("info", {})
+        if norm_title(html.unescape(info.get("title", ""))) != ref:
+            continue
+        if not info.get("type") or info["type"] == "Informal and Other Publications":
+            continue
+        if not _is_published_venue(str(info.get("venue", ""))):
+            continue
+        authors = _dblp_hit_authors(info)
+        if author_hint and not any(
+            mini_hash(author_hint) == first_author_last_name(name) for name in authors
+        ):
+            continue
+        match = _dblp_match(info, "dblp")
+        _log(f"[dblp] match: {match.venue} {info.get('year', '')}")
+        return match
+    if len(hits) >= 101:
+        raise TransientSourceError("dblp title candidate window exceeded")
     return None
 
 
@@ -490,31 +582,38 @@ def _dblp_hit_authors(info: dict) -> list[str]:
 def try_dblp_fuzzy(title: str, author_hint: str, year: str = "") -> Match | None:
     """Title-drift fallback: camera-ready titles often differ from the arXiv
     ones ("Information-Theoretic" -> "Information Theory"), and DBLP's
-    token-AND search then misses entirely. Query author + the most
-    distinctive title tokens instead, and accept token-Jaccard-similar
+    token-AND search then misses entirely. Query the most distinctive
+    title tokens instead, and accept token-Jaccard-similar
     titles — guarded by author and year so different papers can't sneak in.
     """
     if not author_hint:
         return None
-    tokens = sorted(sig_tokens(title), key=len, reverse=True)[:3]
+    tokens = sorted(sig_tokens(title), key=lambda t: (-len(t), t))[:3]
     if not tokens:
         return None
-    q = " ".join([author_hint] + tokens)
+    q = " ".join(tokens)
     with _client() as c:
-        hits = _dblp_search(c, q)
+        hits = _dblp_title_search(c, q)
         hits.sort(key=lambda h: int(h.get("info", {}).get("year", 9999)))
         for hit in hits:
             info = hit.get("info", {})
             hit_title = clean_title(html.unescape(info.get("title", "")))
-            if info.get("venue") == "CoRR" or not info.get("venue"):
+            if (
+                not info.get("type")
+                or info["type"] == "Informal and Other Publications"
+            ):
+                continue
+            if not _is_published_venue(str(info.get("venue", ""))):
                 continue
             if not titles_similar(hit_title, title):
                 continue
             if year and info.get("year"):
                 if abs(int(info["year"]) - int(year)) > 2:
                     continue
-            hit_authors = mini_hash(" ".join(_dblp_hit_authors(info)))
-            if author_hint not in hit_authors:
+            if not any(
+                mini_hash(author_hint) == first_author_last_name(name)
+                for name in _dblp_hit_authors(info)
+            ):
                 continue
             match = _dblp_match(info, "dblp-fuzzy")
             venue = match.venue
@@ -523,6 +622,8 @@ def try_dblp_fuzzy(title: str, author_hint: str, year: str = "") -> Match | None
                 f"@ {venue} {info.get('year', '')}"
             )
             return match
+    if len(hits) >= 101:
+        raise TransientSourceError("dblp title candidate window exceeded")
     return None
 
 

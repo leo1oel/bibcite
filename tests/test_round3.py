@@ -86,9 +86,22 @@ def test_scrub_leaves_clean_files_alone(tmp_path: Path):
     assert bib.read_text() == original  # untouched, not even rewritten
 
 
-def test_dblp_sanitize_strips_syntax_chars():
-    from bibcite.sources import _dblp_sanitize
+def test_dblp_query_does_not_interpret_title_as_sparql(monkeypatch):
+    import httpx
+    from bibcite import sources
 
-    q = _dblp_sanitize("LeJEPA: Provable? Self-Supervised (Learning)")
-    assert ":" not in q and "?" not in q and "(" not in q
-    assert "Self-Supervised" in q  # hyphens survive
+    queries = []
+
+    def get(client, url, params=None):
+        queries.append(params["query"])
+        return httpx.Response(
+            200, request=httpx.Request("GET", url), json={"results": {"bindings": []}}
+        )
+
+    monkeypatch.setattr(sources, "_dblp_get", get)
+    with sources._client() as client:
+        sources._dblp_title_search(
+            client, 'LeJEPA: Provable? Self-Supervised (Learning) " } #'
+        )
+    assert '"supervised learning provable lejepa self"' in queries[0]
+    assert '#"' not in queries[0]
