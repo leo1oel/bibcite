@@ -211,7 +211,7 @@ def _s2_headers() -> dict:
 
 def _s2_batch_status() -> str | None:
     status = os.environ.get("BIBCITE_S2_BATCH_STATUS")
-    return status if status in {"checked", "unavailable"} else None
+    return status if status in {"checked", "unavailable", "disabled"} else None
 
 
 def _mailto() -> str:
@@ -1048,6 +1048,11 @@ def find_published(
     elif batch_status == "unavailable":
         _log("[semanticscholar] batch unavailable")
         incomplete = True
+    elif batch_status == "disabled":
+        # The caller intentionally excluded S2. It is neither an attempted
+        # source nor a failed one, so clean misses from the enabled core
+        # sources remain authoritative.
+        _log("[semanticscholar] disabled by caller")
     # Query every still-viable source concurrently. A preprint with no published
     # version (the common case) misses everywhere, and used to pay the *sum* of
     # each source's latency; now the wall-clock is the slowest single source.

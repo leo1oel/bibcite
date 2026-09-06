@@ -106,3 +106,28 @@ def test_batch_status_suppresses_s2_metadata_request(monkeypatch):
 
     with pytest.raises(SourceUnavailable):
         sources._s2_get(Client(), "https://api.semanticscholar.org/test", {})
+
+
+def test_disabled_s2_is_never_called_and_does_not_taint_clean_misses(monkeypatch):
+    calls = []
+
+    def source(name):
+        def run(*args):
+            calls.append(name)
+            return None
+
+        return run
+
+    monkeypatch.setenv("BIBCITE_S2_BATCH_STATUS", "disabled")
+    monkeypatch.setenv("S2_API_KEY", "must-not-be-used")
+    monkeypatch.setenv("BIBCITE_PUBLIC_SERVICE_URL", "https://example.test")
+    monkeypatch.setattr(
+        sources,
+        "CASCADE",
+        (("semanticscholar", source("s2")), ("dblp", source("dblp"))),
+    )
+
+    match, status = find_published("Clean miss")
+
+    assert (match, status) == (None, "not_found")
+    assert calls == ["dblp"]

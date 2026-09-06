@@ -97,6 +97,27 @@ def cmd_get(args) -> int:
     return 0
 
 
+def cmd_normalize(args) -> int:
+    """Canonicalize already retrieved BibTeX without any network lookup."""
+    try:
+        db = bibfile.parse_bib(Path(args.file).read_text())
+        normalized = []
+        for entry in db.entries:
+            raw_venue = entry.get("booktitle", "") or entry.get("journal", "")
+            canonical = canonicalize(raw_venue, entry.get("year"))
+            if canonical:
+                entry.pop("booktitle", None)
+                entry.pop("journal", None)
+                entry["ENTRYTYPE"] = canonical.entry_type
+                entry[canonical.bib_field] = canonical.name
+            normalized.append(bibfile.entry_to_bibtex(entry))
+    except (OSError, ValueError) as error:
+        _log(f"[bibcite] {error}")
+        return EXIT_ISSUES
+    _emit({"bibtex": normalized})
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # add
 # ---------------------------------------------------------------------------
@@ -288,7 +309,9 @@ def cmd_add(args) -> int:
 # upgrade: batch-match arXiv entries in an existing file (bibMatcher, CLI-style)
 # ---------------------------------------------------------------------------
 
-def _upgrade_entries(path: Path, dry_run: bool) -> dict:
+def _upgrade_entries(
+    path: Path, dry_run: bool, include_published_arxiv: bool = False
+) -> dict:
     """Match every preprint entry in ``path`` to its published version and
     rewrite it in place (unless dry_run). Returns the report; does NOT tidy —
     callers decide."""
@@ -301,7 +324,9 @@ def _upgrade_entries(path: Path, dry_run: bool) -> dict:
     changed = 0
     processed = 0
     for entry in db.entries:
-        if not bibfile.is_preprint(entry):
+        if not bibfile.is_preprint(entry) and not (
+            include_published_arxiv and bibfile.entry_arxiv_id(entry)
+        ):
             continue
         if entry.get("pubstate", "").strip("{}") == "preprint":
             # User-confirmed preprint-only (e.g. never-to-be-published arXiv
@@ -386,7 +411,7 @@ def cmd_upgrade(args) -> int:
     if not path.exists():
         _log(f"[bibcite] {path} does not exist")
         return EXIT_ISSUES
-    result = _upgrade_entries(path, args.dry_run)
+    result = _upgrade_entries(path, args.dry_run, args.include_published_arxiv)
     tidied = False
     if result["upgraded"] and not args.no_tidy:
         tidied = bibfile.run_tidy(path)
@@ -550,7 +575,16 @@ def main(argv=None) -> int:
     u.add_argument("--dry-run", action="store_true")
     u.add_argument("--no-tidy", action="store_true")
     u.add_argument("--no-cache", action="store_true", help="bypass the local match cache")
+    u.add_argument(
+        "--include-published-arxiv",
+        action="store_true",
+        help="also audit published-venue entries that retain an arXiv identifier",
+    )
     u.set_defaults(fn=cmd_upgrade)
+
+    n = sub.add_parser("normalize", help="offline canonicalization of a BibTeX file (prints JSON)")
+    n.add_argument("file")
+    n.set_defaults(fn=cmd_normalize)
 
     t = sub.add_parser("tidy", help="run bibtex-tidy with the canonical flags")
     t.add_argument("file")
