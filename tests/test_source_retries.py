@@ -35,7 +35,7 @@ class _ReadErrorClient:
         return httpx.Response(200, request=request, json={})
 
 
-def test_paced_get_retries_a_single_read_error():
+def test_paced_get_retries_a_single_read_error_for_other_sources():
     client = _ReadErrorClient(failures=1)
 
     response = sources._paced_get(client, "https://dblp.org/test", "dblp", 0)
@@ -44,15 +44,46 @@ def test_paced_get_retries_a_single_read_error():
     assert client.calls == 2
 
 
+@pytest.mark.parametrize("failure", ["timeout", 500, 429])
+def test_dblp_get_never_retries(failure):
+    class Client:
+        calls = 0
+
+        def get(self, url, params=None, timeout=None):
+            self.calls += 1
+            request = httpx.Request("GET", url)
+            if failure == "timeout":
+                raise httpx.ReadTimeout("slow", request=request)
+            return httpx.Response(failure, request=request)
+
+    client = Client()
+    expected = SourceUnavailable if failure == 429 else TransientSourceError
+    with pytest.raises(expected):
+        sources._dblp_get(client, "https://dblp.org/test")
+    assert client.calls == 1
+
+
+def test_dblp_timeout_has_short_phase_caps(monkeypatch):
+    observed = None
+
+    class Client:
+        def get(self, url, params=None, timeout=None):
+            nonlocal observed
+            observed = timeout
+            return httpx.Response(200, request=httpx.Request("GET", url))
+
+    sources._dblp_get(Client(), "https://dblp.org/test")
+    assert isinstance(observed, httpx.Timeout)
+    assert observed.connect == 1.5
+    assert observed.read == 2.5
+    assert observed.write == 1.0
+    assert observed.pool == 1.0
+
+
 def test_dblp_read_failures_do_not_disable_later_batch_entries(monkeypatch):
     def dblp(title, year, arxiv_id, author_hint):
         if title == "First paper":
-            return sources._paced_get(
-                _ReadErrorClient(failures=3),
-                "https://dblp.org/test",
-                "dblp",
-                0,
-            )
+            return sources._dblp_get(_ReadErrorClient(failures=3), "https://dblp.org/test")
         return Match(source="dblp", venue="TMLR", title=title, year="2025")
 
     monkeypatch.setattr(
@@ -110,6 +141,44 @@ def test_requests_use_only_the_remaining_publication_budget(monkeypatch):
         del sources._REQUEST_DEADLINE.value
 
 
+def test_exact_and_fuzzy_share_one_four_second_dblp_budget(monkeypatch):
+    deadlines = []
+    real_with_deadline = sources._with_deadline
+
+    def capture(deadline, fn, *args):
+        if fn in {exact, fuzzy}:
+            deadlines.append(deadline)
+        return real_with_deadline(deadline, fn, *args)
+
+    def exact(*args):
+        return None
+
+    def fuzzy(*args):
+        return None
+
+    started = sources.time.monotonic()
+    monkeypatch.setattr(sources, "CASCADE", (("dblp", exact),))
+    monkeypatch.setattr(sources, "try_dblp_fuzzy", fuzzy)
+    monkeypatch.setattr(sources, "_with_deadline", capture)
+
+    match, status = find_published("A paper", author_hint="author")
+
+    assert (match, status) == (None, "not_found")
+    assert len(deadlines) == 2
+    assert deadlines[0] == deadlines[1]
+    assert deadlines[0] <= started + 4.01
+
+
+def test_expired_budget_prevents_author_fuzzy_from_claiming_not_found(monkeypatch):
+    clock = iter((0.0, 4.0))
+    monkeypatch.setattr(sources.time, "monotonic", lambda: next(clock, 4.0))
+    monkeypatch.setattr(sources, "CASCADE", (("dblp", lambda *args: None),))
+
+    match, status = find_published("A paper", author_hint="author")
+
+    assert (match, status) == (None, "incomplete")
+
+
 def test_upgrade_retries_dblp_after_previous_entry_read_failures(
     tmp_path, monkeypatch
 ):
@@ -133,12 +202,7 @@ def test_upgrade_retries_dblp_after_previous_entry_read_failures(
 
     def dblp(title, year, arxiv_id, author_hint):
         if title == "First paper":
-            return sources._paced_get(
-                _ReadErrorClient(failures=3),
-                "https://dblp.org/test",
-                "dblp",
-                0,
-            )
+            return sources._dblp_get(_ReadErrorClient(failures=3), "https://dblp.org/test")
         return Match(source="dblp", venue="TMLR", title=title, year="2025")
 
     monkeypatch.setattr(

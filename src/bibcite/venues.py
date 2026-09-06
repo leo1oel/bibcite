@@ -2,7 +2,7 @@
 
 Parses the vendored ``data/strings.bib`` @string table (journals /
 conferences / workshops) and maps venue strings returned by DBLP, Semantic
-Scholar, CrossRef, Unpaywall, etc. onto the canonical names.
+Scholar, CrossRef, OpenAlex, etc. onto the canonical names.
 """
 
 import re

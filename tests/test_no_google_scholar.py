@@ -12,7 +12,7 @@ resolver = importlib.import_module("bibcite.resolve")
 
 
 @pytest.mark.parametrize("operation", ["get", "add", "upgrade"])
-def test_cli_never_queries_google_scholar(operation, monkeypatch, tmp_path, capsys):
+def test_cli_never_queries_removed_sources(operation, monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(cache, "DISABLED", True)
     monkeypatch.setattr(sources, "_DISABLED", {})
     monkeypatch.setattr(
@@ -27,7 +27,7 @@ def test_cli_never_queries_google_scholar(operation, monkeypatch, tmp_path, caps
         ),
     )
     visited = []
-    for name in ("dblp", "semantic_scholar", "crossref", "unpaywall", "openalex"):
+    for name in ("dblp", "semantic_scholar", "crossref", "openalex"):
 
         def miss(*args, source=name):
             visited.append(source)
@@ -59,11 +59,7 @@ def test_cli_never_queries_google_scholar(operation, monkeypatch, tmp_path, caps
         args = ["upgrade", str(path), "--dry-run"]
     cli.main(args)
     json.loads(capsys.readouterr().out)
-    assert set(visited) == {
-        "dblp",
-        "semantic_scholar",
-        "crossref",
-        "unpaywall",
-        "openalex",
-    }
+    assert set(visited) == {"dblp", "semantic_scholar", "crossref", "openalex"}
     assert requests == []
+    assert not hasattr(sources, "try_unpaywall")
+    assert all("scholar.google" not in url and "unpaywall" not in url for url in requests)

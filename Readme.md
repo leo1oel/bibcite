@@ -145,9 +145,14 @@ Mark a confirmed preprint-only entry with `pubstate = {preprint}` if you want `c
 
 ## How resolution works
 
-For arXiv IDs and titles, `bibcite` collects paper metadata and checks publication sources in a cascade derived from [PaperMemory](https://github.com/vict0rsch/PaperMemory): DBLP, Semantic Scholar, Crossref, Unpaywall, and OpenAlex.
+For arXiv IDs and titles, `bibcite` collects paper metadata and checks publication sources in a cascade derived from [PaperMemory](https://github.com/vict0rsch/PaperMemory): DBLP, Semantic Scholar, Crossref, and OpenAlex.
 Google Scholar scraping is excluded so CAPTCHA challenges cannot delay publication lookup.
 A published match must have the same normalized title or pass a guarded title-drift check, have a plausible publication year, and name a non-preprint venue.
+
+DBLP requests are single-attempt, with short connection/read timeouts and a shared four-second scheduling budget for exact and title-drift lookup.
+Socket timeouts apply per network phase, so this budget is not a hard end-to-end deadline.
+Published DBLP records are constructed from the search response, without another request for a BibTeX export.
+A failed or unfinished DBLP check stays incomplete rather than being treated as evidence that a paper is unpublished.
 
 Successful published matches are cached at `~/.cache/bibcite/published.json`.
 Preprint-only results are never cached because a paper may be published later.
@@ -163,7 +168,7 @@ These optional environment variables improve source reliability:
 | --- | --- |
 | `OPENALEX_API_KEY` | Uses your OpenAlex quota instead of the anonymous shared pool. |
 | `S2_API_KEY` | Uses a private Semantic Scholar quota. |
-| `BIBCITE_MAILTO` | Sends your contact email to the Crossref, OpenAlex, and Unpaywall polite pools. |
+| `BIBCITE_MAILTO` | Sends your contact email to the Crossref and OpenAlex polite pools. |
 | `BIBCITE_PUBLIC_SERVICE_URL` | Routes keyless OpenAlex, Semantic Scholar, and Crossref requests through an HTTPS `/v1/query` service supplied by the embedding application. |
 | `BIBCITE_CORE_SOURCES` | Overrides the sources required for a trustworthy publication check. |
 | `BIBCITE_NO_CACHE=1` | Disables the local publication cache. |
@@ -200,7 +205,7 @@ uv tool install --editable .
 
 ## Acknowledgements
 
-Inspired by [PaperMemory](https://github.com/vict0rsch/PaperMemory), with formatting by [bibtex-tidy](https://github.com/FlamingTempura/bibtex-tidy) and metadata from arXiv, DBLP, Semantic Scholar, Crossref, Unpaywall, and OpenAlex.
+Inspired by [PaperMemory](https://github.com/vict0rsch/PaperMemory), with formatting by [bibtex-tidy](https://github.com/FlamingTempura/bibtex-tidy) and metadata from arXiv, DBLP, Semantic Scholar, Crossref, and OpenAlex.
 
 ## License
 

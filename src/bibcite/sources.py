@@ -1,7 +1,7 @@
 """API clients for the publication-matching cascade.
 
 Order and matching rules ported from PaperMemory's bibMatcher:
-DBLP -> Semantic Scholar -> CrossRef -> Unpaywall -> OpenAlex.
+DBLP -> Semantic Scholar -> CrossRef -> OpenAlex.
 All matchers verify identity via normalized-title equality and reject
 preprint venues (arXiv / CoRR / bioRxiv / ...).
 """
@@ -78,7 +78,11 @@ def _request_timeout(cap: float = TIMEOUT) -> float:
 
 
 def _get(
-    c: httpx.Client, url: str, *, timeout: float = TIMEOUT, **kwargs
+    c: httpx.Client,
+    url: str,
+    *,
+    timeout: float | httpx.Timeout = TIMEOUT,
+    **kwargs,
 ) -> httpx.Response:
     """GET directly or route keyless supported APIs through the public service."""
     public_url = os.environ.get("BIBCITE_PUBLIC_SERVICE_URL")
@@ -98,7 +102,10 @@ def _get(
         "crossref": bool(os.environ.get("BIBCITE_MAILTO")),
     }
     if not public_url or not provider or personal_access[provider]:
-        return c.get(url, timeout=_request_timeout(timeout), **kwargs)
+        effective_timeout = (
+            timeout if isinstance(timeout, httpx.Timeout) else _request_timeout(timeout)
+        )
+        return c.get(url, timeout=effective_timeout, **kwargs)
 
     service = urlsplit(public_url)
     loopback = service.hostname in {"localhost", "127.0.0.1", "::1"}
@@ -183,7 +190,7 @@ def _s2_headers() -> dict:
 
 
 def _mailto() -> str:
-    """Contact email for the polite pools (CrossRef/OpenAlex/Unpaywall).
+    """Contact email for the polite pools (CrossRef/OpenAlex).
     Set BIBCITE_MAILTO to use your own."""
     return os.environ.get("BIBCITE_MAILTO") or "bibcite@gmail.com"
 
@@ -340,7 +347,26 @@ def _paced_get(
 
 # DBLP throttles at roughly 1-2 req/s and escalates to temporary IP bans.
 def _dblp_get(c: httpx.Client, url: str, params: dict | None = None) -> httpx.Response:
-    return _paced_get(c, url, "dblp", 0.8, params=params)
+    wait = 0.8 - (time.monotonic() - _LAST_REQUEST.get("dblp", 0.0))
+    if wait > 0:
+        _sleep(wait)
+    _LAST_REQUEST["dblp"] = time.monotonic()
+    remaining = _request_timeout(2.5)
+    timeout = httpx.Timeout(
+        connect=min(1.5, remaining),
+        read=min(2.5, remaining),
+        write=min(1.0, remaining),
+        pool=min(1.0, remaining),
+    )
+    try:
+        response = _get(c, url, params=params, timeout=timeout)
+    except httpx.HTTPError as e:
+        raise TransientSourceError(f"dblp unreachable ({type(e).__name__})") from e
+    if response.status_code == 429:
+        raise SourceUnavailable("dblp rate-limited (429)")
+    if response.status_code >= 500:
+        raise TransientSourceError(f"dblp server error ({response.status_code})")
+    return response
 
 
 def _dblp_sanitize(q: str) -> str:
@@ -352,17 +378,74 @@ def _dblp_sanitize(q: str) -> str:
 
 
 def _dblp_search(c: httpx.Client, q: str, h: int = 100) -> list:
-    """One search request; a 500 (broad all-common-words query × large h
-    times out their backend) is retried once with a small result window
-    before giving up on this query variant."""
+    """Run one DBLP search while retaining the full result window."""
     url = "https://dblp.org/search/publ/api"
     q = _dblp_sanitize(q)
     r = _dblp_get(c, url, params={"q": q, "format": "json", "h": h})
-    if r.status_code == 500 and h > 10:
-        _log("[dblp] 500 on broad query — retrying with h=10")
-        r = _dblp_get(c, url, params={"q": q, "format": "json", "h": 10})
     r.raise_for_status()
     return r.json().get("result", {}).get("hits", {}).get("hit", []) or []
+
+
+def _dblp_bibtex(info: dict, venue: str) -> str:
+    """Build the DBLP record from search JSON, avoiding a second .bib request."""
+    from .bibfile import entry_to_bibtex
+
+    record_type = str(info.get("type", "")).lower()
+    key = str(info.get("key") or "dblp")
+    if record_type == "editorship":
+        entry_type = "proceedings" if key.startswith("conf/") else "book"
+    elif key.startswith("phd/"):
+        entry_type = "phdthesis"
+    elif record_type == "parts in books or collections":
+        entry_type = "incollection"
+    elif record_type == "books and theses":
+        entry_type = "book"
+    else:
+        entry_type = (
+            "inproceedings"
+            if "conference" in record_type or key.startswith("conf/")
+            else "article"
+        )
+    fields = {
+        "ID": key,
+        "ENTRYTYPE": entry_type,
+        "author": " and ".join(_dblp_hit_authors(info)),
+        "title": clean_title(html.unescape(str(info.get("title", "")))),
+        "year": str(info.get("year", "")),
+        "pages": str(info.get("pages", "")),
+        "volume": str(info.get("volume", "")),
+        "number": str(info.get("number", "")),
+        "doi": str(info.get("doi", "")),
+        "url": str(info.get("ee") or info.get("url") or ""),
+        "publisher": str(info.get("publisher", "")),
+        "editor": str(info.get("editor", "")),
+        "isbn": str(info.get("isbn", "")),
+    }
+    if entry_type in {"inproceedings", "incollection"}:
+        fields["booktitle"] = venue
+    elif entry_type == "article":
+        fields["journal"] = venue
+    if record_type == "editorship":
+        fields["editor"] = fields["editor"] or fields["author"]
+        fields.pop("author")
+    return entry_to_bibtex(fields)
+
+
+def _dblp_match(info: dict, source: str) -> Match:
+    venue = info["venue"]
+    if isinstance(venue, list):
+        venue = venue[0]
+    title = clean_title(html.unescape(info.get("title", "")))
+    return Match(
+        source=source,
+        venue=str(venue),
+        title=title,
+        year=str(info.get("year", "")),
+        authors=_dblp_hit_authors(info),
+        doi=info.get("doi", ""),
+        bibtex=_dblp_bibtex(info, str(venue)),
+        url=info.get("ee", "") or info.get("url", ""),
+    )
 
 
 def try_dblp(title: str, author_hint: str = "") -> Match | None:
@@ -386,27 +469,10 @@ def try_dblp(title: str, author_hint: str = "") -> Match | None:
                     continue
                 if info.get("venue") == "CoRR" or not info.get("venue"):
                     continue
-                venue = info["venue"]
-                if isinstance(venue, list):
-                    venue = venue[0]
-                bibtex = ""
-                if info.get("url"):
-                    try:
-                        br = _dblp_get(c, info["url"] + ".bib")
-                        if br.status_code == 200:
-                            bibtex = br.text
-                    except SourceUnavailable:
-                        pass  # keep the match; construct from fields
+                match = _dblp_match(info, "dblp")
+                venue = match.venue
                 _log(f"[dblp] match: {venue} {info.get('year', '')}")
-                return Match(
-                    source="dblp",
-                    venue=str(venue),
-                    title=clean_title(html.unescape(info.get("title", ""))),
-                    year=str(info.get("year", "")),
-                    doi=info.get("doi", ""),
-                    bibtex=bibtex,
-                    url=info.get("ee", "") or info.get("url", ""),
-                )
+                return match
     return None
 
 
@@ -414,7 +480,11 @@ def _dblp_hit_authors(info: dict) -> list[str]:
     authors = (info.get("authors") or {}).get("author") or []
     if isinstance(authors, dict):
         authors = [authors]
-    return [a.get("text", "") for a in authors if isinstance(a, dict)]
+    return [
+        re.sub(r"\s+\d{4}$", "", a.get("text", ""))
+        for a in authors
+        if isinstance(a, dict) and a.get("text")
+    ]
 
 
 def try_dblp_fuzzy(title: str, author_hint: str, year: str = "") -> Match | None:
@@ -446,30 +516,13 @@ def try_dblp_fuzzy(title: str, author_hint: str, year: str = "") -> Match | None
             hit_authors = mini_hash(" ".join(_dblp_hit_authors(info)))
             if author_hint not in hit_authors:
                 continue
-            venue = info["venue"]
-            if isinstance(venue, list):
-                venue = venue[0]
-            bibtex = ""
-            if info.get("url"):
-                try:
-                    br = _dblp_get(c, info["url"] + ".bib")
-                    if br.status_code == 200:
-                        bibtex = br.text
-                except SourceUnavailable:
-                    pass  # keep the match; construct from fields
+            match = _dblp_match(info, "dblp-fuzzy")
+            venue = match.venue
             _log(
                 f"[dblp-fuzzy] match with title drift: '{hit_title}' "
                 f"@ {venue} {info.get('year', '')}"
             )
-            return Match(
-                source="dblp-fuzzy",
-                venue=str(venue),
-                title=hit_title,
-                year=str(info.get("year", "")),
-                doi=info.get("doi", ""),
-                bibtex=bibtex,
-                url=info.get("ee", "") or info.get("url", ""),
-            )
+            return match
     return None
 
 
@@ -615,9 +668,8 @@ def try_crossref(title: str) -> Match | None:
         if r.status_code == 429:
             raise SourceUnavailable("CrossRef rate-limited (429)")
         if r.status_code >= 500:
-            # A dead endpoint (Unpaywall search 500s for days at a time)
-            # gets benched for the run instead of adding latency + noise
-            # to every remaining query.
+            # A dead endpoint gets benched for the run instead of adding
+            # latency and noise to every remaining query.
             raise SourceUnavailable(f"CrossRef server error ({r.status_code})")
         r.raise_for_status()
         payload = r.json()
@@ -661,52 +713,6 @@ def try_crossref(title: str) -> Match | None:
 
 
 # ---------------------------------------------------------------------------
-# Unpaywall
-# ---------------------------------------------------------------------------
-
-def try_unpaywall(title: str) -> Match | None:
-    with _client() as c:
-        r = _get(
-            c,
-            "https://api.unpaywall.org/v2/search",
-            params={"query": title, "is_oa": "true", "email": _mailto()},
-        )
-        if r.status_code == 429:
-            raise SourceUnavailable("Unpaywall rate-limited (429)")
-        if r.status_code >= 500:
-            # A dead endpoint (Unpaywall search 500s for days at a time)
-            # gets benched for the run instead of adding latency + noise
-            # to every remaining query.
-            raise SourceUnavailable(f"Unpaywall server error ({r.status_code})")
-        r.raise_for_status()
-        ref = norm_title(title)
-        for res in r.json().get("results") or []:
-            resp = res.get("response", {})
-            if norm_title(resp.get("title", "")) != ref:
-                continue
-            venue = (resp.get("journal_name") or "").strip()
-            if not _is_published_venue(venue):
-                continue
-            doi = resp.get("doi", "")
-            if ARXIV_DOI.match(doi):
-                continue
-            authors = [
-                " ".join(filter(None, [a.get("given"), a.get("family")]))
-                for a in resp.get("z_authors") or []
-            ]
-            _log(f"[unpaywall] match: {venue} {resp.get('year', '')}")
-            return Match(
-                source="unpaywall",
-                venue=venue,
-                title=clean_title(resp.get("title", "")),
-                year=str(resp.get("year") or ""),
-                authors=[a for a in authors if a],
-                doi=doi,
-            )
-    return None
-
-
-# ---------------------------------------------------------------------------
 # OpenAlex (not in PaperMemory; unauthenticated with generous rate limits, so
 # it doubles as the metadata fallback when the arXiv API / S2 are throttled)
 # ---------------------------------------------------------------------------
@@ -722,9 +728,8 @@ def openalex_search(title: str) -> dict | None:
         if r.status_code == 429:
             raise SourceUnavailable("OpenAlex rate-limited (429)")
         if r.status_code >= 500:
-            # A dead endpoint (Unpaywall search 500s for days at a time)
-            # gets benched for the run instead of adding latency + noise
-            # to every remaining query.
+            # A dead endpoint gets benched for the run instead of adding
+            # latency and noise to every remaining query.
             raise SourceUnavailable(f"OpenAlex server error ({r.status_code})")
         r.raise_for_status()
         ref = norm_title(title)
@@ -829,7 +834,6 @@ CASCADE = (
     ("dblp", lambda t, y, a, au: try_dblp(t, au)),
     ("semanticscholar", lambda t, y, a, au: try_semantic_scholar(t, y, a)),
     ("crossref", lambda t, y, a, au: try_crossref(t)),
-    ("unpaywall", lambda t, y, a, au: try_unpaywall(t)),
     ("openalex", lambda t, y, a, au: try_openalex(t)),
 )
 
@@ -840,8 +844,7 @@ CASCADE = (
 _DISABLED: dict[str, str] = {}
 
 # Only these sources are authoritative enough that losing one taints a miss
-# into "incomplete". Unpaywall flakiness is routine and must not stop
-# "not_found" from ever being trustworthy.
+# into "incomplete".
 # Override with BIBCITE_CORE_SOURCES="dblp,semanticscholar" if one of these
 # is down for days and keeps every verdict incomplete.
 CORE_SOURCES = frozenset(
@@ -880,7 +883,9 @@ def find_published(
     # version (the common case) misses everywhere, and used to pay the *sum* of
     # each source's latency; now the wall-clock is the slowest single source.
     # The first verified hit by CASCADE priority still wins.
-    deadline = time.monotonic() + PUBLICATION_TIMEOUT
+    started = time.monotonic()
+    deadline = started + PUBLICATION_TIMEOUT
+    dblp_deadline = min(deadline, started + 4.0)
     active = [(name, fn) for name, fn in CASCADE if name not in _DISABLED]
     outcomes: dict[str, tuple] = {}
     if active:
@@ -888,7 +893,7 @@ def find_published(
             futures = {
                 pool.submit(
                     _with_deadline,
-                    deadline,
+                    dblp_deadline if name == "dblp" else deadline,
                     fn,
                     title,
                     year,
@@ -940,23 +945,28 @@ def find_published(
         author_hint
         and dblp_outcome is not None
         and dblp_outcome[0] == "miss"
-        and time.monotonic() < deadline
     ):
-        try:
-            m = _with_deadline(deadline, try_dblp_fuzzy, title, author_hint, year)
-            if m:
-                cache.put(cache_key, m.__dict__)
-                return m, "found"
-            clean_misses += 1
-        except TransientSourceError as e:
+        if time.monotonic() >= dblp_deadline:
             incomplete = True
-            _log(f"[dblp-fuzzy] transient failure for this entry: {e}")
-        except SourceUnavailable as e:
-            _DISABLED["dblp"] = str(e)
-            incomplete = True
-        except Exception as e:
-            incomplete = True
-            _log(f"[dblp-fuzzy] error: {type(e).__name__}: {e}")
+            _log("[dblp-fuzzy] skipped: DBLP lookup budget exhausted")
+        else:
+            try:
+                m = _with_deadline(
+                    dblp_deadline, try_dblp_fuzzy, title, author_hint, year
+                )
+                if m:
+                    cache.put(cache_key, m.__dict__)
+                    return m, "found"
+                clean_misses += 1
+            except TransientSourceError as e:
+                incomplete = True
+                _log(f"[dblp-fuzzy] transient failure for this entry: {e}")
+            except SourceUnavailable as e:
+                _DISABLED["dblp"] = str(e)
+                incomplete = True
+            except Exception as e:
+                incomplete = True
+                _log(f"[dblp-fuzzy] error: {type(e).__name__}: {e}")
     if not clean_misses:
         return None, "unavailable"
     return None, ("incomplete" if incomplete else "not_found")
