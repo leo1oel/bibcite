@@ -35,13 +35,13 @@ class _ReadErrorClient:
         return httpx.Response(200, request=request, json={})
 
 
-def test_paced_get_retries_a_single_read_error_for_other_sources():
+def test_s2_get_never_retries_a_read_error(monkeypatch):
     client = _ReadErrorClient(failures=1)
+    monkeypatch.setattr(sources, "_s2_gate", lambda key: None)
 
-    response = sources._paced_get(client, "https://dblp.org/test", "dblp", 0)
-
-    assert response.status_code == 200
-    assert client.calls == 2
+    with pytest.raises(TransientSourceError):
+        sources._s2_get(client, "https://api.semanticscholar.org/test", {})
+    assert client.calls == 1
 
 
 @pytest.mark.parametrize("failure", ["timeout", 500, 429])

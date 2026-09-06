@@ -14,6 +14,7 @@ def clean_environment(monkeypatch):
         "OPENALEX_API_KEY",
         "S2_API_KEY",
         "SEMANTIC_SCHOLAR_API_KEY",
+        "BIBCITE_S2_BATCH_STATUS",
     ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(sources, "_LAST_REQUEST", {})
@@ -133,11 +134,10 @@ def test_public_service_http_failure_is_not_retried(status, monkeypatch):
         return httpx.Response(status)
 
     with _client(handler) as client, pytest.raises(sources.SourceUnavailable):
-        sources._paced_get(
+        sources._s2_get(
             client,
             "https://api.semanticscholar.org/graph/v1/paper/search",
-            "semanticscholar",
-            0,
+            {},
         )
 
     assert calls == 1
@@ -153,11 +153,10 @@ def test_public_service_timeout_is_not_retried(monkeypatch):
         raise httpx.ReadTimeout("timed out", request=request)
 
     with _client(handler) as client, pytest.raises(sources.SourceUnavailable):
-        sources._paced_get(
+        sources._s2_get(
             client,
             "https://api.semanticscholar.org/graph/v1/paper/search",
-            "semanticscholar",
-            0,
+            {},
         )
 
     assert calls == 1
@@ -170,6 +169,19 @@ def test_public_service_404_is_preserved(monkeypatch):
         response = sources._get(client, "https://api.openalex.org/works/W1")
 
     assert response.status_code == 404
+
+
+@pytest.mark.parametrize("code", ["queue_busy", "daily_quota", "upstream_rate_limit"])
+def test_public_limit_reasons_are_preserved_without_retry(monkeypatch, code):
+    monkeypatch.setenv("BIBCITE_PUBLIC_SERVICE_URL", "https://literature.test/v1/query")
+    with _client(
+        lambda request: httpx.Response(429, json={"code": code, "error": "secret"})
+    ) as client:
+        with pytest.raises(sources.SourceUnavailable, match=code) as error:
+            sources._get(
+                client, "https://api.semanticscholar.org/graph/v1/paper/search"
+            )
+    assert "secret" not in str(error.value)
 
 
 @pytest.mark.parametrize(

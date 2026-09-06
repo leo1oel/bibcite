@@ -65,3 +65,44 @@ def test_everything_down_is_unavailable(monkeypatch):
     )
     match, status = find_published("Some Title", author_hint="smith")
     assert (match, status) == (None, "unavailable")
+
+
+@pytest.mark.parametrize(
+    ("batch_status", "message"),
+    (("checked", "batch result reused"), ("unavailable", "batch unavailable")),
+)
+def test_batch_status_skips_s2_but_keeps_other_sources_conservative(
+    batch_status, message, monkeypatch, capsys
+):
+    calls = []
+
+    def source(name):
+        def run(*args):
+            calls.append(name)
+            return None
+
+        return run
+
+    monkeypatch.setenv("BIBCITE_S2_BATCH_STATUS", batch_status)
+    monkeypatch.setattr(
+        sources,
+        "CASCADE",
+        (("semanticscholar", source("s2")), ("crossref", source("crossref"))),
+    )
+
+    match, status = find_published("Batch checked title")
+
+    assert (match, status) == (None, "incomplete")
+    assert calls == ["crossref"]
+    assert f"[semanticscholar] {message}" in capsys.readouterr().err
+
+
+def test_batch_status_suppresses_s2_metadata_request(monkeypatch):
+    monkeypatch.setenv("BIBCITE_S2_BATCH_STATUS", "checked")
+
+    class Client:
+        def get(self, *args, **kwargs):
+            raise AssertionError("network request must be suppressed")
+
+    with pytest.raises(SourceUnavailable):
+        sources._s2_get(Client(), "https://api.semanticscholar.org/test", {})

@@ -7,15 +7,18 @@ preprint venues (arXiv / CoRR / bioRxiv / ...).
 """
 
 import html
+import hashlib
 import json
 import os
 import re
+import sqlite3
 import sys
 import threading
 import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from pathlib import Path
 from urllib.parse import urlsplit
 
 import httpx
@@ -104,8 +107,7 @@ def _get(
     personal_access = {
         "openalex": bool(os.environ.get("OPENALEX_API_KEY")),
         "semanticscholar": bool(
-            os.environ.get("S2_API_KEY")
-            or os.environ.get("SEMANTIC_SCHOLAR_API_KEY")
+            os.environ.get("S2_API_KEY") or os.environ.get("SEMANTIC_SCHOLAR_API_KEY")
         ),
         "crossref": bool(os.environ.get("BIBCITE_MAILTO")),
     }
@@ -147,6 +149,16 @@ def _get(
     if response.status_code == 404:
         return response
     if response.status_code == 429:
+        try:
+            code = response.json().get("code")
+        except (ValueError, AttributeError):
+            code = None
+        if isinstance(code, str) and code in {
+            "queue_busy",
+            "daily_quota",
+            "upstream_rate_limit",
+        }:
+            raise SourceUnavailable(f"public literature service {code}")
         raise SourceUnavailable("public literature service rate-limited (429)")
     if response.is_error:
         raise SourceUnavailable(
@@ -195,6 +207,11 @@ def _s2_headers() -> dict:
     quota. Set S2_API_KEY (or SEMANTIC_SCHOLAR_API_KEY)."""
     key = os.environ.get("S2_API_KEY") or os.environ.get("SEMANTIC_SCHOLAR_API_KEY")
     return {"x-api-key": key} if key else {}
+
+
+def _s2_batch_status() -> str | None:
+    status = os.environ.get("BIBCITE_S2_BATCH_STATUS")
+    return status if status in {"checked", "unavailable"} else None
 
 
 def _mailto() -> str:
@@ -308,49 +325,9 @@ def arxiv_metadata(arxiv_id: str) -> ArxivMeta:
 # DBLP
 # ---------------------------------------------------------------------------
 
-# Client-side pacing + backoff-retry, shared by the throttle-prone sources.
-# Pacing prevents the 429 in the first place; on a 429 we back off (honoring
-# Retry-After) instead of instantly poisoning the rest of a batch run — only
-# repeated failure raises SourceUnavailable (which disables the source).
+# Process-local pacing for DBLP. Semantic Scholar uses a cross-process SQLite
+# dispatch gate below, shared with the Rust batch client.
 _LAST_REQUEST: dict[str, float] = {}
-
-
-def _paced_get(
-    c: httpx.Client,
-    url: str,
-    source: str,
-    min_interval: float,
-    params: dict | None = None,
-    headers: dict | None = None,
-) -> httpx.Response:
-    for attempt in range(2):
-        wait = min_interval - (time.monotonic() - _LAST_REQUEST.get(source, 0.0))
-        if wait > 0:
-            _sleep(wait)
-        _LAST_REQUEST[source] = time.monotonic()
-        try:
-            r = _get(c, url, params=params, headers=headers)
-        except httpx.HTTPError as e:  # Retry transport errors once before failing.
-            if attempt < 1:
-                _sleep(1)
-                continue
-            raise TransientSourceError(
-                f"{source} unreachable ({type(e).__name__})"
-            ) from e
-        if r.status_code == 429:
-            # A 429 is usually a persistent rate-limit (e.g. the shared
-            # unauthenticated Semantic Scholar pool), not a transient blip, so a
-            # long client-side backoff rarely clears it and just stalls an
-            # interactive resolve. Take at most one quick retry when the server
-            # asks for a short wait, then give up and let the circuit breaker
-            # skip this source for the rest of the run.
-            retry_after = int(r.headers.get("Retry-After") or 0)
-            if attempt < 1 and retry_after <= 2:
-                _sleep(max(retry_after, 1))
-                continue
-            raise SourceUnavailable(f"{source} rate-limited (429)")
-        return r
-    raise SourceUnavailable(f"{source} unavailable")
 
 
 # DBLP throttles at roughly 1-2 req/s and escalates to temporary IP bans.
@@ -673,9 +650,7 @@ def arxiv_abs_metadata(arxiv_id: str) -> ArxivMeta | None:
     def metas(name: str) -> list[str]:
         return [
             html.unescape(m)
-            for m in re.findall(
-                rf'<meta\s+name="{name}"\s+content="([^"]*)"', page
-            )
+            for m in re.findall(rf'<meta\s+name="{name}"\s+content="([^"]*)"', page)
         ]
 
     titles = metas("citation_title")
@@ -691,12 +666,96 @@ def arxiv_abs_metadata(arxiv_id: str) -> ArxivMeta | None:
     )
 
 
+def _s2_pacing_path() -> Path:
+    cache_home = os.environ.get("XDG_CACHE_HOME")
+    root = Path(cache_home) if cache_home else Path.home() / ".cache"
+    return root / "bibcite" / "requests.sqlite3"
+
+
+def _s2_gate(key: str) -> None:
+    """Reserve one S2 dispatch slot using the Rust-compatible SQLite protocol."""
+    started = time.monotonic()
+    publication_deadline = getattr(_REQUEST_DEADLINE, "value", None)
+    gate_deadline = started + 2.2
+    if publication_deadline is not None:
+        gate_deadline = min(gate_deadline, publication_deadline)
+    remaining = gate_deadline - time.monotonic()
+    if remaining <= 0:
+        raise PublicationTimeout("publication lookup timed out before S2 pacing")
+
+    path = _s2_pacing_path()
+    connection = None
+    in_transaction = False
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(path, timeout=remaining)
+        busy_ms = max(1, min(2200, int(remaining * 1000)))
+        connection.execute(f"PRAGMA busy_timeout = {busy_ms}")
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS s2_pacing "
+            "(key TEXT PRIMARY KEY, last_dispatch INTEGER NOT NULL)"
+        )
+        remaining = gate_deadline - time.monotonic()
+        if remaining <= 0:
+            raise SourceUnavailable("Semantic Scholar pacing deadline exhausted")
+        connection.execute(f"PRAGMA busy_timeout = {max(1, int(remaining * 1000))}")
+        connection.execute("BEGIN IMMEDIATE")
+        in_transaction = True
+        row = connection.execute(
+            "SELECT last_dispatch FROM s2_pacing WHERE key = ?", (key,)
+        ).fetchone()
+        now_ms = int(time.time() * 1000)
+        wait = max(0.0, ((row[0] + 1100) - now_ms) / 1000) if row else 0.0
+        if time.monotonic() + wait > gate_deadline:
+            raise SourceUnavailable("Semantic Scholar pacing deadline exhausted")
+        if wait:
+            time.sleep(wait)
+        if time.monotonic() > gate_deadline:
+            raise SourceUnavailable("Semantic Scholar pacing deadline exhausted")
+        dispatch_ms = int(time.time() * 1000)
+        connection.execute(
+            "INSERT INTO s2_pacing(key, last_dispatch) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET last_dispatch = excluded.last_dispatch",
+            (key, dispatch_ms),
+        )
+        connection.commit()
+        in_transaction = False
+    except PublicationTimeout:
+        raise
+    except (OSError, sqlite3.Error) as e:
+        raise SourceUnavailable(
+            f"Semantic Scholar pacing unavailable ({type(e).__name__})"
+        ) from e
+    finally:
+        if connection is not None:
+            if in_transaction:
+                connection.rollback()
+            connection.close()
+
+
 def _s2_get(c: httpx.Client, url: str, params: dict) -> httpx.Response:
-    # With an API key S2 allows ~1 req/s on a private quota; unauthenticated
-    # requests share a global pool where backoff still beats instant defeat.
-    return _paced_get(
-        c, url, "semanticscholar", 1.0, params=params, headers=_s2_headers()
-    )
+    if _s2_batch_status() is not None:
+        raise SourceUnavailable("Semantic Scholar batch status already supplied")
+
+    key = os.environ.get("S2_API_KEY") or os.environ.get("SEMANTIC_SCHOLAR_API_KEY")
+    # A keyless public-service request is paced by the service itself. Personal
+    # and direct anonymous traffic coordinate with the Rust app by key hash.
+    if key or not os.environ.get("BIBCITE_PUBLIC_SERVICE_URL"):
+        pacing_key = hashlib.sha256(key.encode()).hexdigest() if key else "anonymous"
+        _s2_gate(pacing_key)
+    try:
+        response = _get(c, url, params=params, headers=_s2_headers())
+    except httpx.HTTPError as e:
+        raise TransientSourceError(
+            f"semanticscholar unreachable ({type(e).__name__})"
+        ) from e
+    if response.status_code == 429:
+        raise SourceUnavailable("semanticscholar rate-limited (429)")
+    if response.status_code >= 500:
+        raise TransientSourceError(
+            f"semanticscholar server error ({response.status_code})"
+        )
+    return response
 
 
 def s2_arxiv_metadata(arxiv_id: str) -> ArxivMeta | None:
@@ -753,6 +812,7 @@ def try_semantic_scholar(
 # ---------------------------------------------------------------------------
 # CrossRef
 # ---------------------------------------------------------------------------
+
 
 def try_crossref(title: str) -> Match | None:
     with _client() as c:
@@ -818,6 +878,7 @@ def try_crossref(title: str) -> Match | None:
 # it doubles as the metadata fallback when the arXiv API / S2 are throttled)
 # ---------------------------------------------------------------------------
 
+
 def openalex_search(title: str) -> dict | None:
     """OpenAlex work with an exactly-matching normalized title, or None."""
     with _client() as c:
@@ -843,9 +904,7 @@ def openalex_search(title: str) -> dict | None:
 def openalex_arxiv_id(work: dict) -> str:
     for loc in work.get("locations") or []:
         for f in ("landing_page_url", "pdf_url"):
-            m = re.search(
-                r"arxiv\.org/(?:abs|pdf)/(\d{4}\.\d{4,5})", loc.get(f) or ""
-            )
+            m = re.search(r"arxiv\.org/(?:abs|pdf)/(\d{4}\.\d{4,5})", loc.get(f) or "")
             if m:
                 return m.group(1)
     return ""
@@ -890,6 +949,7 @@ def try_openalex(title: str) -> Match | None:
 # ---------------------------------------------------------------------------
 # CrossRef by DOI (for `bibcite add file 10.xxxx/yyy`)
 # ---------------------------------------------------------------------------
+
 
 def crossref_by_doi(doi: str) -> Match | None:
     with _client() as c:
@@ -951,7 +1011,8 @@ _DISABLED: dict[str, str] = {}
 CORE_SOURCES = frozenset(
     s.strip()
     for s in (
-        os.environ.get("BIBCITE_CORE_SOURCES") or "dblp,semanticscholar,crossref,openalex"
+        os.environ.get("BIBCITE_CORE_SOURCES")
+        or "dblp,semanticscholar,crossref,openalex"
     ).split(",")
     if s.strip()
 )
@@ -980,6 +1041,13 @@ def find_published(
 
     # Core sources lost earlier in this run taint this query's verdict too.
     incomplete = any(n in CORE_SOURCES for n in _DISABLED)
+    batch_status = _s2_batch_status()
+    if batch_status == "checked":
+        _log("[semanticscholar] batch result reused")
+        incomplete = True
+    elif batch_status == "unavailable":
+        _log("[semanticscholar] batch unavailable")
+        incomplete = True
     # Query every still-viable source concurrently. A preprint with no published
     # version (the common case) misses everywhere, and used to pay the *sum* of
     # each source's latency; now the wall-clock is the slowest single source.
@@ -987,7 +1055,11 @@ def find_published(
     started = time.monotonic()
     deadline = started + PUBLICATION_TIMEOUT
     dblp_deadline = min(deadline, started + 4.0)
-    active = [(name, fn) for name, fn in CASCADE if name not in _DISABLED]
+    active = [
+        (name, fn)
+        for name, fn in CASCADE
+        if name not in _DISABLED and not (name == "semanticscholar" and batch_status)
+    ]
     outcomes: dict[str, tuple] = {}
     if active:
         with ThreadPoolExecutor(max_workers=len(active)) as pool:
@@ -1042,11 +1114,7 @@ def find_published(
     # failure has already spent its chance for this entry, and retrying the
     # fuzzy form was doubling the worst-case interactive latency.
     dblp_outcome = outcomes.get("dblp")
-    if (
-        author_hint
-        and dblp_outcome is not None
-        and dblp_outcome[0] == "miss"
-    ):
+    if author_hint and dblp_outcome is not None and dblp_outcome[0] == "miss":
         if time.monotonic() >= dblp_deadline:
             incomplete = True
             _log("[dblp-fuzzy] skipped: DBLP lookup budget exhausted")
@@ -1129,14 +1197,15 @@ def fetch_web_page(url: str) -> WebPage:
     except httpx.HTTPError as e:
         raise SourceUnavailable(f"could not fetch {url}: {e}") from e
 
-    title = (
-        _meta_content(body, "citation_title", "DC.title", "og:title", "twitter:title")
-        or _title_tag(body)
-    )
+    title = _meta_content(
+        body, "citation_title", "DC.title", "og:title", "twitter:title"
+    ) or _title_tag(body)
     authors = [
         author
         for author in (
-            _meta_content(body, "citation_author", "DC.creator", "author", "article:author"),
+            _meta_content(
+                body, "citation_author", "DC.creator", "author", "article:author"
+            ),
         )
         if author
     ]
@@ -1151,7 +1220,9 @@ def fetch_web_page(url: str) -> WebPage:
     )
     year = _year_in(date) or _year_in_path(url)
     site = _meta_content(body, "og:site_name") or _site_author(_host(url))
-    return WebPage(url=str(response.url), title=title, authors=authors, year=year, site=site)
+    return WebPage(
+        url=str(response.url), title=title, authors=authors, year=year, site=site
+    )
 
 
 def _year_in(text: str) -> str:
@@ -1200,7 +1271,24 @@ def _site_author(host: str) -> str:
     labels = [label for label in host.lower().split(".") if label]
     if not labels:
         return host
-    generic = {"github", "io", "com", "org", "net", "edu", "gov", "ai", "dev",
-               "co", "uk", "cn", "blog", "www", "docs", "pages", "medium"}
+    generic = {
+        "github",
+        "io",
+        "com",
+        "org",
+        "net",
+        "edu",
+        "gov",
+        "ai",
+        "dev",
+        "co",
+        "uk",
+        "cn",
+        "blog",
+        "www",
+        "docs",
+        "pages",
+        "medium",
+    }
     named = [label for label in labels if label not in generic]
     return (named[0] if named else labels[0]).capitalize()
