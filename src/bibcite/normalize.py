@@ -30,8 +30,7 @@ def mini_hash(s: str, replace: str = "") -> str:
     """PaperMemory's miniHash: lowercase, non-alphanumeric replaced.
 
     When ``replace`` is non-empty, each non-word char maps to one replacement
-    char so string positions are preserved (needed by the Google Scholar
-    parser).
+    char so string positions are preserved.
     """
     if replace:
         return re.sub(r"[^a-z0-9_]", replace, s.lower())

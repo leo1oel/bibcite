@@ -1,7 +1,7 @@
 """API clients for the publication-matching cascade.
 
 Order and matching rules ported from PaperMemory's bibMatcher:
-DBLP -> Semantic Scholar -> Google Scholar -> CrossRef -> Unpaywall.
+DBLP -> Semantic Scholar -> CrossRef -> Unpaywall -> OpenAlex.
 All matchers verify identity via normalized-title equality and reject
 preprint venues (arXiv / CoRR / bioRxiv / ...).
 """
@@ -15,6 +15,7 @@ import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -79,8 +80,64 @@ def _request_timeout(cap: float = TIMEOUT) -> float:
 def _get(
     c: httpx.Client, url: str, *, timeout: float = TIMEOUT, **kwargs
 ) -> httpx.Response:
-    """GET with the per-request cap narrowed by the active total deadline."""
-    return c.get(url, timeout=_request_timeout(timeout), **kwargs)
+    """GET directly or route keyless supported APIs through the public service."""
+    public_url = os.environ.get("BIBCITE_PUBLIC_SERVICE_URL")
+    target = urlsplit(url)
+    providers = {
+        "api.openalex.org": "openalex",
+        "api.semanticscholar.org": "semanticscholar",
+        "api.crossref.org": "crossref",
+    }
+    provider = providers.get((target.hostname or "").lower())
+    personal_access = {
+        "openalex": bool(os.environ.get("OPENALEX_API_KEY")),
+        "semanticscholar": bool(
+            os.environ.get("S2_API_KEY")
+            or os.environ.get("SEMANTIC_SCHOLAR_API_KEY")
+        ),
+        "crossref": bool(os.environ.get("BIBCITE_MAILTO")),
+    }
+    if not public_url or not provider or personal_access[provider]:
+        return c.get(url, timeout=_request_timeout(timeout), **kwargs)
+
+    service = urlsplit(public_url)
+    loopback = service.hostname in {"localhost", "127.0.0.1", "::1"}
+    if (
+        (service.scheme != "https" and not (service.scheme == "http" and loopback))
+        or not service.hostname
+        or service.username is not None
+        or service.password is not None
+        or service.query
+        or service.fragment
+    ):
+        raise SourceUnavailable("BIBCITE_PUBLIC_SERVICE_URL is invalid")
+
+    params = kwargs.get("params") or {}
+    safe_params = {
+        str(key): str(value)
+        for key, value in params.items()
+        if str(key).lower() not in {"api_key", "mailto"}
+    }
+    try:
+        response = c.post(
+            public_url,
+            json={"provider": provider, "path": target.path, "params": safe_params},
+            timeout=_request_timeout(timeout),
+            follow_redirects=False,
+        )
+    except httpx.HTTPError as e:
+        raise SourceUnavailable(
+            f"public literature service unavailable ({type(e).__name__})"
+        ) from e
+    if response.status_code == 404:
+        return response
+    if response.status_code == 429:
+        raise SourceUnavailable("public literature service rate-limited (429)")
+    if response.is_error:
+        raise SourceUnavailable(
+            f"public literature service error ({response.status_code})"
+        )
+    return response
 
 
 def _sleep(delay: float):
@@ -540,62 +597,6 @@ def try_semantic_scholar(
 
 
 # ---------------------------------------------------------------------------
-# Google Scholar (port of PaperMemory's background fetchGSData)
-# ---------------------------------------------------------------------------
-
-def try_google_scholar(title: str) -> Match | None:
-    with _client(browser=True) as c:
-        r = _get(
-            c,
-            "https://scholar.google.com/scholar",
-            params={"q": title, "hl": "en"},
-        )
-        if r.status_code == 429 or "captcha" in r.text.lower()[:5000]:
-            raise SourceUnavailable("Google Scholar is blocking requests (captcha/429)")
-        r.raise_for_status()
-        parts = r.text.split("gs_res_ccl_mid")
-        if len(parts) < 2:
-            return None
-        page = parts[1]
-        # Each result title anchor looks like <a id="DATAID" href=...>Title</a>
-        # (the title may contain <b> highlights and HTML entities).
-        data_id = ""
-        for am in re.finditer(
-            r'<a[^>]*\bid="([\w-]{6,40})"[^>]*>(.*?)</a>', page, re.S
-        ):
-            text = html.unescape(re.sub(r"<[^>]+>", "", am.group(2)))
-            if norm_title(text) == norm_title(title):
-                data_id = am.group(1)
-                break
-        if not data_id:
-            return None
-        cite_url = (
-            "https://scholar.google.com/scholar?q=info:"
-            f"{data_id}:scholar.google.com/&output=cite&scirp=0&hl=en"
-        )
-        cite_html = _get(c, cite_url).text
-        bm = re.search(r'<a[^>]*href="([^">]+)"[^>]*>BibTex</a>', cite_html, re.I)
-        if not bm:
-            return None
-        bib_url = re.sub(r"\s+", "", bm.group(1).replace("&amp;", "&"))
-        bibtex = _get(c, bib_url).text
-    from .bibfile import parse_bibtex_entry  # local import to avoid cycle
-
-    entry = parse_bibtex_entry(bibtex)
-    venue = entry.get("journal", "") or entry.get("booktitle", "")
-    if venue and not venue.lower().endswith("xiv") and "preprint" not in venue.lower():
-        _log(f"[googlescholar] match: {venue}")
-        return Match(
-            source="googlescholar",
-            venue=venue,
-            title=clean_title(entry.get("title", title)),
-            year=entry.get("year", ""),
-            bibtex=bibtex,
-        )
-    return None
-
-
-# ---------------------------------------------------------------------------
 # CrossRef
 # ---------------------------------------------------------------------------
 
@@ -827,7 +828,6 @@ def crossref_by_doi(doi: str) -> Match | None:
 CASCADE = (
     ("dblp", lambda t, y, a, au: try_dblp(t, au)),
     ("semanticscholar", lambda t, y, a, au: try_semantic_scholar(t, y, a)),
-    ("googlescholar", lambda t, y, a, au: try_google_scholar(t)),
     ("crossref", lambda t, y, a, au: try_crossref(t)),
     ("unpaywall", lambda t, y, a, au: try_unpaywall(t)),
     ("openalex", lambda t, y, a, au: try_openalex(t)),
@@ -840,8 +840,8 @@ CASCADE = (
 _DISABLED: dict[str, str] = {}
 
 # Only these sources are authoritative enough that losing one taints a miss
-# into "incomplete". Google Scholar captchas and Unpaywall flakiness are
-# routine and must not stop "not_found" from ever being trustworthy.
+# into "incomplete". Unpaywall flakiness is routine and must not stop
+# "not_found" from ever being trustworthy.
 # Override with BIBCITE_CORE_SOURCES="dblp,semanticscholar" if one of these
 # is down for days and keeps every verdict incomplete.
 CORE_SOURCES = frozenset(

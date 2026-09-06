@@ -43,7 +43,7 @@ def test_core_source_429_taints_verdict(monkeypatch):
     monkeypatch.setattr(
         sources,
         "CASCADE",
-        _cascade(dblp="raise", googlescholar=None, crossref=None),
+        _cascade(dblp="raise", unpaywall=None, crossref=None),
     )
     match, status = find_published("Some Title", author_hint="smith")
     assert (match, status) == (None, "incomplete")
@@ -60,11 +60,11 @@ def test_previously_disabled_core_source_taints_next_queries(monkeypatch):
 
 
 def test_noncore_outage_does_not_taint(monkeypatch):
-    # Google Scholar captcha is routine; a miss stays trustworthy.
+    # Unpaywall outages are routine; a miss stays trustworthy.
     monkeypatch.setattr(
         sources,
         "CASCADE",
-        _cascade(dblp=None, googlescholar="raise", crossref=None),
+        _cascade(dblp=None, unpaywall="raise", crossref=None),
     )
     match, status = find_published("Some Title", author_hint="smith")
     assert (match, status) == (None, "not_found")
