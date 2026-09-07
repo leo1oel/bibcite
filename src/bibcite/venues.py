@@ -46,6 +46,8 @@ EXTRA_ALIASES = {
     "national aaai": "AAAI",
     "aaai": "AAAI",
     "acl": "ACL",
+    "eacl": "EACL",
+    "conference european chapter association for computational linguistics": "EACL",
     "emnlp": "EMNLP",
     "naacl": "NAACL",
     "naacl hlt": "NAACL",

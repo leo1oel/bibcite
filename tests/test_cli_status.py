@@ -85,6 +85,37 @@ def test_upgrade_opt_in_preserves_published_venue_on_no_match(
     assert bib.read_text() == before
 
 
+def test_upgrade_keeps_eacl_match_as_conference(tmp_path, monkeypatch):
+    bib = tmp_path / "refs.bib"
+    bib.write_text(
+        "@misc{deepinsert, author={Choraria, Moulik}, title={DeepInsert}, "
+        "howpublished={arXiv preprint}, year={2026}}\n"
+    )
+    monkeypatch.setattr(
+        cli,
+        "find_published",
+        lambda *args: (
+            Match(
+                venue="EACL (Volume 1: Long Papers)",
+                year="2026",
+                doi="10.18653/v1/2026.eacl-long.332",
+                source="dblp",
+            ),
+            "found",
+        ),
+    )
+
+    result = cli._upgrade_entries(bib, dry_run=False)
+    updated = bibfile.load_bib_file(bib).entries[0]
+
+    assert result["upgraded"] == 1
+    assert updated["ENTRYTYPE"] == "inproceedings"
+    assert updated["booktitle"] == (
+        "Proceedings of the Conference of the European Chapter of the Association for Computational Linguistics (EACL)"
+    )
+    assert "journal" not in updated
+
+
 def test_add_fails_when_automatic_tidy_fails(tmp_path, monkeypatch, capsys):
     bib = tmp_path / "refs.bib"
     monkeypatch.setattr(bibfile, "run_tidy", lambda path: False)
@@ -173,6 +204,19 @@ def test_fix_reports_remaining_lint_problems(tmp_path, monkeypatch):
     monkeypatch.setattr(bibfile, "run_tidy", lambda path: True)
 
     assert main(["fix", str(bib)]) == 1
+
+
+def test_matching_an_unchanged_publication_does_not_rewrite_it(tmp_path, monkeypatch):
+    bib = tmp_path / "refs.bib"
+    before = "@inproceedings{lora, title={LoRA}, eprint={2106.09685}, year={2022}, booktitle={International Conference on Learning Representations (ICLR)}}\n"
+    bib.write_text(before)
+    monkeypatch.setattr(cli, "find_published", lambda *args: (
+        Match(source="dblp", venue="ICLR", title="LoRA", year="2022"), "found"
+    ))
+    result = cli._upgrade_entries(bib, dry_run=False, include_published_arxiv=True)
+    assert result["matched"] == 1
+    assert result["upgraded"] == 0
+    assert bib.read_text() == before
 
 
 def test_fix_succeeds_when_file_is_clean(tmp_path, monkeypatch):

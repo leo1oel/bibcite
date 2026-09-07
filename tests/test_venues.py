@@ -31,6 +31,12 @@ from bibcite.venues import canonicalize
             "ICCV",
         ),
         ("Annual Meeting of the Association for Computational Linguistics", None, "ACL"),
+        ("EACL (Volume 1: Long Papers)", 2026, "EACL"),
+        (
+            "Proceedings of the 19th Conference of the European Chapter of the Association for Computational Linguistics (Volume 1: Long Papers)",
+            2026,
+            "EACL",
+        ),
         (
             "Conference on Empirical Methods in Natural Language Processing",
             None,

@@ -110,6 +110,7 @@ def cmd_normalize(args) -> int:
                 entry.pop("journal", None)
                 entry["ENTRYTYPE"] = canonical.entry_type
                 entry[canonical.bib_field] = canonical.name
+            bibfile.clean_publication_fields(entry)
             normalized.append(bibfile.entry_to_bibtex(entry))
     except (OSError, ValueError) as error:
         _log(f"[bibcite] {error}")
@@ -133,6 +134,7 @@ def _resolve_user_bibtex(text: str) -> Resolved:
         entry[canonical.bib_field] = canonical.name
     if entry.get("pages"):
         entry["pages"] = fix_pages(entry["pages"])
+    bibfile.clean_publication_fields(entry)
     published = not bibfile.is_preprint(entry)
     return Resolved(
         entry,
@@ -360,9 +362,9 @@ def _upgrade_entries(
         canonical = canonicalize(match.venue, match.year or entry.get("year"))
         venue_name = canonical.name if canonical else match.venue
         if not dry_run:
+            before = dict(entry)
             entry.pop("journal", None)
             entry.pop("booktitle", None)
-            entry.pop("howpublished", None)
             if canonical:
                 entry["ENTRYTYPE"] = canonical.entry_type
                 entry[canonical.bib_field] = canonical.name
@@ -382,7 +384,9 @@ def _upgrade_entries(
                 # Camera-ready titles drift from arXiv ones; the published
                 # title is the correct one to cite.
                 entry["title"] = match.title
-            changed += 1
+            bibfile.clean_publication_fields(entry)
+            if entry != before:
+                changed += 1
         report.append(
             {
                 "key": entry["ID"],

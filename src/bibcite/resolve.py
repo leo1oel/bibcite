@@ -9,7 +9,7 @@ import re
 import sys
 from dataclasses import dataclass
 
-from .bibfile import NOISE_FIELDS, parse_bibtex_entry
+from .bibfile import NOISE_FIELDS, clean_publication_fields, parse_bibtex_entry
 from .normalize import (
     clean_title,
     first_author_last_name,
@@ -178,8 +178,6 @@ def _finalize(entry: dict, meta: ArxivMeta | None) -> dict:
         entry["url"] = meta.abs_url  # prefer the arXiv link for access
         entry["eprint"] = meta.arxiv_id
         entry["archiveprefix"] = "arXiv"
-        if meta.primary_class:
-            entry["primaryclass"] = meta.primary_class
     elif entry.get("doi"):
         url = entry.get("url", "")
         # Modernize legacy resolver links (http://dx.doi.org/...) and fill in
@@ -192,6 +190,7 @@ def _finalize(entry: dict, meta: ArxivMeta | None) -> dict:
     year = entry.get("year", "") or "XXXX"
     entry["ID"] = make_key(author, year, entry.get("title", ""))
     entry.pop("__venue", None)
+    clean_publication_fields(entry)
     return entry
 
 

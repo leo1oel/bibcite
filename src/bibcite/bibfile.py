@@ -20,7 +20,7 @@ from .normalize import norm_title
 # \cite{} commands valid.
 TIDY_ARGS = [
     "--modify",
-    "--omit=pages,publisher,doi,timestamp,biburl,bibsource,abstract,month,series,volume,editor,note,date,number,address,issn,isbn",
+    "--omit=pages,publisher,primaryclass,timestamp,biburl,bibsource,abstract,month,series,volume,editor,note,date,number,address,issn,isbn",
     "--curly",
     "--blank-lines",
     "--trailing-commas",
@@ -33,6 +33,25 @@ TIDY_ARGS = [
 ]
 
 NOISE_FIELDS = ("timestamp", "biburl", "bibsource", "crossref", "month")
+
+def clean_publication_fields(entry: dict) -> None:
+    """Keep identity fields; discard classification and obsolete preprint text.
+
+    Unknown venue macros are left alone rather than guessing their meaning.
+    Web-page publishing descriptions and genuine preprint entries are retained.
+    """
+    entry.pop("primaryclass", None)
+    if str(entry.get("pubstate", "")).strip("{}").lower() == "preprint":
+        return
+    venues = [entry.get(name, "") for name in ("journal", "booktitle")]
+    published = any(isinstance(v, str) and v.strip() and not any(
+        marker in v.lower() for marker in ("arxiv", "preprint", "corr")
+    ) for v in venues)
+    description = entry.get("howpublished", "")
+    if published and isinstance(description, str) and any(
+        marker in description.lower() for marker in ("arxiv", "preprint")
+    ):
+        entry.pop("howpublished", None)
 
 # BibTeX month macros. bibtexparser's common_strings only defines jan..dec;
 # CrossRef's transform endpoint emits bare full names (month=June), which
@@ -284,6 +303,22 @@ def run_tidy(path: Path) -> bool:
             "[bibcite] cannot run bibtex-tidy: neither bibtex-tidy nor npx was found; "
             "install Node.js/npm"
         )
+        return False
+    # Preserve user macros/concatenations while applying the same field policy
+    # used by resolution and upgrade previews. Let tidy handle formatting.
+    try:
+        parser = _parser()
+        parser.interpolate_strings = False
+        db = bibtexparser.loads(path.read_text(), parser=parser)
+        changed = False
+        for entry in db.entries:
+            before = dict(entry)
+            clean_publication_fields(entry)
+            changed = changed or entry != before
+        if changed:
+            _write_db(path, db)
+    except Exception as error:
+        _log(f"[bibcite] cannot clean bibliography fields: {error}")
         return False
     proc = subprocess.run(
         cmd + [str(path)] + TIDY_ARGS, capture_output=True, text=True

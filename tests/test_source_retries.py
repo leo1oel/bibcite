@@ -132,6 +132,74 @@ def test_dblp_transport_failure_skips_the_fuzzy_retry(monkeypatch):
     assert fuzzy_calls == 0
 
 
+def test_dblp_timeout_retry_can_succeed(monkeypatch):
+    calls = 0
+
+    def dblp(*args):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise sources.DblpTimeout("simulated timeout")
+        return Match(source="dblp", venue="EACL", title="A paper", year="2026")
+
+    monkeypatch.setattr(sources, "CASCADE", (("dblp", dblp),))
+
+    match, status = find_published("A paper")
+
+    assert status == "found"
+    assert match is not None
+    assert calls == 2
+
+
+def test_dblp_fuzzy_timeout_retry_exhaustion_is_diagnostic(
+    monkeypatch, capsys
+):
+    fuzzy_calls = 0
+
+    def fuzzy(*args):
+        nonlocal fuzzy_calls
+        fuzzy_calls += 1
+        raise sources.DblpTimeout("simulated timeout")
+
+    monkeypatch.setattr(sources, "CASCADE", (("dblp", lambda *args: None),))
+    monkeypatch.setattr(sources, "try_dblp_fuzzy", fuzzy)
+
+    match, status = find_published("A paper", author_hint="author")
+
+    assert (match, status) == (None, "incomplete")
+    assert fuzzy_calls == 2
+    stderr = capsys.readouterr().err
+    assert "[dblp-fuzzy] request timed out; retrying once" in stderr
+    assert "dblp fuzzy timed out after 2 attempts" in stderr
+
+
+def test_exact_and_fuzzy_share_one_timeout_retry(monkeypatch, capsys):
+    exact_calls = 0
+    fuzzy_calls = 0
+
+    def exact(*args):
+        nonlocal exact_calls
+        exact_calls += 1
+        if exact_calls == 1:
+            raise sources.DblpTimeout("simulated exact timeout")
+        return None
+
+    def fuzzy(*args):
+        nonlocal fuzzy_calls
+        fuzzy_calls += 1
+        raise sources.DblpTimeout("simulated fuzzy timeout")
+
+    monkeypatch.setattr(sources, "CASCADE", (("dblp", exact),))
+    monkeypatch.setattr(sources, "try_dblp_fuzzy", fuzzy)
+
+    match, status = find_published("A paper", author_hint="author")
+
+    assert (match, status) == (None, "incomplete")
+    assert exact_calls == 2
+    assert fuzzy_calls == 1
+    assert "dblp fuzzy timed out (timeout retry already used)" in capsys.readouterr().err
+
+
 def test_requests_use_only_the_remaining_publication_budget(monkeypatch):
     monkeypatch.setattr(sources.time, "monotonic", lambda: 7.0)
     sources._REQUEST_DEADLINE.value = 10.0
@@ -165,8 +233,8 @@ def test_exact_and_fuzzy_share_one_four_second_dblp_budget(monkeypatch):
 
     assert (match, status) == (None, "not_found")
     assert len(deadlines) == 2
-    assert deadlines[0] == deadlines[1]
-    assert deadlines[0] <= started + 4.01
+    assert deadlines[0] <= deadlines[1] <= started + 4.01
+    assert deadlines[0] <= started + 2.01
 
 
 def test_expired_budget_prevents_author_fuzzy_from_claiming_not_found(monkeypatch):

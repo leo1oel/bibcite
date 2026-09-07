@@ -75,6 +75,10 @@ class PublicationTimeout(TransientSourceError):
     """The total publication-matching budget was exhausted."""
 
 
+class DblpTimeout(TransientSourceError):
+    """A DBLP request timed out and may be retried once within its budget."""
+
+
 _REQUEST_DEADLINE = threading.local()
 
 
@@ -345,6 +349,8 @@ def _dblp_get(c: httpx.Client, url: str, params: dict | None = None) -> httpx.Re
     )
     try:
         response = _get(c, url, params=params, timeout=timeout)
+    except httpx.TimeoutException as e:
+        raise DblpTimeout(f"dblp request timed out ({type(e).__name__})") from e
     except httpx.HTTPError as e:
         raise TransientSourceError(f"dblp unreachable ({type(e).__name__})") from e
     if response.status_code == 429:
@@ -1018,6 +1024,30 @@ CORE_SOURCES = frozenset(
 )
 
 
+def _try_dblp_stage(deadline: float, retry_state: dict, stage: str, fn, *args):
+    """Run a DBLP stage, sharing one timeout retry across the whole lookup."""
+    # Reserve time for the retry instead of letting the first timeout consume
+    # the entire lookup budget and making the second attempt a no-op.
+    first_deadline = deadline if retry_state["used"] else min(
+        deadline, time.monotonic() + 2.0
+    )
+    try:
+        return _with_deadline(first_deadline, fn, *args)
+    except (DblpTimeout, PublicationTimeout) as e:
+        if retry_state["used"]:
+            raise TransientSourceError(
+                f"dblp {stage} timed out (timeout retry already used)"
+            ) from e
+        retry_state["used"] = True
+        _log(f"[dblp-{stage}] request timed out; retrying once")
+        try:
+            return _with_deadline(deadline, fn, *args)
+        except (DblpTimeout, PublicationTimeout) as e:
+            raise TransientSourceError(
+                f"dblp {stage} timed out after 2 attempts"
+            ) from e
+
+
 def find_published(
     title: str, year: str = "", arxiv_id: str = "", author_hint: str = ""
 ) -> tuple[Match | None, str]:
@@ -1060,6 +1090,7 @@ def find_published(
     started = time.monotonic()
     deadline = started + PUBLICATION_TIMEOUT
     dblp_deadline = min(deadline, started + 4.0)
+    dblp_retry = {"used": False}
     active = [
         (name, fn)
         for name, fn in CASCADE
@@ -1070,13 +1101,13 @@ def find_published(
         with ThreadPoolExecutor(max_workers=len(active)) as pool:
             futures = {
                 pool.submit(
-                    _with_deadline,
+                    _try_dblp_stage if name == "dblp" else _with_deadline,
                     dblp_deadline if name == "dblp" else deadline,
-                    fn,
-                    title,
-                    year,
-                    arxiv_id,
-                    author_hint,
+                    *(
+                        (dblp_retry, "exact", fn, title, year, arxiv_id, author_hint)
+                        if name == "dblp"
+                        else (fn, title, year, arxiv_id, author_hint)
+                    ),
                 ): name
                 for name, fn in active
             }
@@ -1086,6 +1117,7 @@ def find_published(
                     m = future.result()
                     if m:
                         outcomes[name] = ("found", m)
+                        _log(f"[{name}] publication matched")
                     else:
                         outcomes[name] = ("miss", None)
                         _log(f"[{name}] no publication found")
@@ -1125,8 +1157,14 @@ def find_published(
             _log("[dblp-fuzzy] skipped: DBLP lookup budget exhausted")
         else:
             try:
-                m = _with_deadline(
-                    dblp_deadline, try_dblp_fuzzy, title, author_hint, year
+                m = _try_dblp_stage(
+                    dblp_deadline,
+                    dblp_retry,
+                    "fuzzy",
+                    try_dblp_fuzzy,
+                    title,
+                    author_hint,
+                    year,
                 )
                 if m:
                     cache.put(cache_key, m.__dict__)
