@@ -154,6 +154,81 @@ def test_dblp_fuzzy_still_requires_author_and_plausible_year(monkeypatch, author
     assert match is None
 
 
+def _sonic_hit():
+    """The real DBLP record that used to be returned for GMT's arXiv title.
+
+    Two papers on humanoid whole-body motion tracking, one year apart, sharing
+    a co-author named Chen: every guard the fuzzy path had was satisfied, and
+    the audit rewrote GMT's entry into SONIC's title and DOI.
+    """
+    return {
+        "info": {
+            "authors": {
+                "author": [
+                    {"text": "Zhengyi Luo 0001"},
+                    {"text": "Ye Yuan 0001"},
+                    {"text": "Sirui Chen"},
+                    {"text": "Tairan He"},
+                ]
+            },
+            "title": "SONIC: Supersizing motion tracking for natural humanoid whole-body control.",
+            "venue": "Sci. Robotics",
+            "year": "2026",
+            "doi": "10.1126/SCIROBOTICS.AED4592",
+            "url": "https://dblp.org/rec/journals/scirobotics/LuoYCH26",
+            "key": "journals/scirobotics/LuoYCH26",
+            "type": "Journal Articles",
+        }
+    }
+
+
+GMT_TITLE = "GMT: General Motion Tracking for Humanoid Whole-Body Control"
+
+
+def test_dblp_fuzzy_rejects_a_different_paper_that_merely_reads_alike(monkeypatch):
+    monkeypatch.setattr(sources, "_dblp_title_search", lambda *args: [_sonic_hit()])
+
+    assert sources.try_dblp_fuzzy(GMT_TITLE, "chen", "2025") is None
+
+
+def test_dblp_fuzzy_requires_the_first_author_not_any_co_author(monkeypatch):
+    # Same paper's own title, so only the author rule can reject it: "chen" is
+    # the third author here, and a shared co-author is not identity.
+    hit = _sonic_hit()
+    hit["info"]["title"] = "SONIC: Supersizing Motion Tracking for Natural Humanoid Whole-Body Control"
+
+    assert sources.same_paper_title(hit["info"]["title"], hit["info"]["title"])
+    monkeypatch.setattr(sources, "_dblp_title_search", lambda *args: [hit])
+    assert sources.try_dblp_fuzzy(hit["info"]["title"], "chen", "2026") is None
+    assert sources.try_dblp_fuzzy(hit["info"]["title"], "luo", "2026") is not None
+
+
+def test_a_cached_record_for_another_paper_is_not_served(tmp_path, monkeypatch):
+    """The wrong match this bug wrote to disk must not outlive the fix.
+
+    ``find_published`` caches by query title and used to return the record
+    verbatim, so every later run reproduced the same wrong answer without
+    consulting a single guard.
+    """
+    from bibcite import cache
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    monkeypatch.setattr(cache, "DISABLED", False)
+    monkeypatch.setattr(sources, "CASCADE", [])
+    record = sources._dblp_match(_sonic_hit()["info"], "dblp-fuzzy")
+    cache.put(sources.norm_title(GMT_TITLE), record.__dict__)
+    cache.put(sources.norm_title(record.title), record.__dict__)
+
+    match, status = sources.find_published(GMT_TITLE, "2025", "2506.14770", "chen")
+
+    assert match is None
+    assert status != "found"
+    # Cached under its own title, the very same record still serves normally.
+    match, status = sources.find_published(record.title, "2026", "", "luo")
+    assert status == "found"
+    assert match.doi == "10.1126/SCIROBOTICS.AED4592"
+
+
 def _triples(key="conf/test/Lovelace25", title="A Published Paper."):
     prefix = "https://dblp.org/rdf/schema#"
     url = "https://dblp.org/rec/" + key

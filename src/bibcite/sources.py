@@ -28,8 +28,8 @@ from .normalize import (
     first_author_last_name,
     mini_hash,
     norm_title,
+    same_paper_title,
     sig_tokens,
-    titles_similar,
 )
 
 UA = "bibcite/0.6 (https://github.com/leo1oel/bibcite)"
@@ -565,9 +565,14 @@ def _dblp_hit_authors(info: dict) -> list[str]:
 def try_dblp_fuzzy(title: str, author_hint: str, year: str = "") -> Match | None:
     """Title-drift fallback: camera-ready titles often differ from the arXiv
     ones ("Information-Theoretic" -> "Information Theory"), and DBLP's
-    token-AND search then misses entirely. Query the most distinctive
-    title tokens instead, and accept token-Jaccard-similar
-    titles — guarded by author and year so different papers can't sneak in.
+    token-AND search then misses entirely. Query the most distinctive title
+    tokens instead.
+
+    Only the *query* is loose. Acceptance is an identity test — same short
+    name, at most one reworded word, and the same FIRST author — because this
+    is the one publication path where the returned title may differ from the
+    one we asked for, and a wrong hit here rewrites a citation to a different
+    paper.
     """
     if not author_hint:
         return None
@@ -588,14 +593,16 @@ def try_dblp_fuzzy(title: str, author_hint: str, year: str = "") -> Match | None
                 continue
             if not _is_published_venue(str(info.get("venue", ""))):
                 continue
-            if not titles_similar(hit_title, title):
+            if not same_paper_title(hit_title, title):
                 continue
             if year and info.get("year"):
                 if abs(int(info["year"]) - int(year)) > 2:
                     continue
-            if not any(
-                mini_hash(author_hint) == first_author_last_name(name)
-                for name in _dblp_hit_authors(info)
+            # The first author specifically: a shared co-author is no evidence
+            # of identity in a field where the same groups publish repeatedly.
+            hit_authors = _dblp_hit_authors(info)
+            if not hit_authors or mini_hash(author_hint) != first_author_last_name(
+                hit_authors[0]
             ):
                 continue
             match = _dblp_match(info, "dblp-fuzzy")
@@ -1066,8 +1073,14 @@ def find_published(
     cache_key = norm_title(title)
     cached = cache.get(cache_key)
     if cached:
-        _log(f"[cache] hit: {cached.get('venue', '')} ({cached.get('source', '')})")
-        return Match(**cached), "found"
+        match = Match(**cached)
+        # A stored record proves only that some earlier run accepted it. Hold it
+        # to the rules in force now, so a matching bug cannot keep serving its
+        # wrong answer from disk after the bug itself is fixed.
+        if same_paper_title(match.title, title) and _is_published_venue(match.venue):
+            _log(f"[cache] hit: {match.venue} ({match.source})")
+            return match, "found"
+        _log(f"[cache] discarding a record that is not this paper: {match.title!r}")
 
     # Core sources lost earlier in this run taint this query's verdict too.
     incomplete = any(n in CORE_SOURCES for n in _DISABLED)
