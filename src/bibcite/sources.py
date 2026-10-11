@@ -1001,6 +1001,52 @@ def crossref_by_doi(doi: str) -> Match | None:
 
 
 # ---------------------------------------------------------------------------
+# ACL Anthology by DOI
+# ---------------------------------------------------------------------------
+
+# The Anthology mints 10.18653/v1/<anthology id> for its papers. Crossref's
+# copy of those records loses given names ("Wayne Xin Zhao" becomes "Xin
+# Zhao"), so the Anthology's own export is the record to cite.
+ACL_DOI = re.compile(r"^10\.18653/v1/(\S+)$", re.I)
+
+
+def acl_anthology_by_doi(doi: str) -> Match | None:
+    """The Anthology's BibTeX export for one of its DOIs, or None when the
+    DOI is not an Anthology one or the Anthology has no such entry."""
+    from .bibfile import entry_to_bibtex, parse_bibtex_entry
+
+    m = ACL_DOI.match(doi)
+    if not m:
+        return None
+    anthology_id = m.group(1)
+    # DOIs are case-insensitive but the Anthology's legacy ids ("P19-1001")
+    # are not; its newer ids ("2023.emnlp-main.20") are all lowercase.
+    if re.fullmatch(r"[a-z]\d{2}-\d{4}", anthology_id, re.I):
+        anthology_id = anthology_id.upper()
+    with _client() as c:
+        r = _get(c, f"https://aclanthology.org/{anthology_id}.bib")
+    if r.status_code == 404:
+        return None
+    r.raise_for_status()
+    # The export wraps name lists across indented lines.
+    entry = {k: " ".join(v.split()) for k, v in parse_bibtex_entry(r.text).items()}
+    # The export must describe the DOI we asked for, not whatever the URL
+    # happened to serve.
+    if entry.get("doi", "").lower() != doi.lower():
+        return None
+    return Match(
+        source="acl-anthology",
+        venue=entry.get("booktitle") or entry.get("journal") or "",
+        title=clean_title(entry.get("title", "")),
+        year=entry.get("year", ""),
+        authors=[a.strip() for a in entry.get("author", "").split(" and ") if a.strip()],
+        doi=entry["doi"],
+        bibtex=entry_to_bibtex(entry),
+        url=entry.get("url", ""),
+    )
+
+
+# ---------------------------------------------------------------------------
 # The cascade
 # ---------------------------------------------------------------------------
 

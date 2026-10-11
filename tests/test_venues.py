@@ -61,6 +61,12 @@ from bibcite.venues import canonicalize
             2022,
             "CVPRW",
         ),
+        ("ECCV (Workshops)", 2018, "ECCVW"),
+        ("Proceedings of CVPR Workshops", 2020, "CVPRW"),
+        # Venues whose own name is a workshop are not a conference's track.
+        ("IEEE Information Theory Workshop", 2015, "ITW"),
+        ("Annual Workshop on Computational Learning Theory", 1992, "COLT92"),
+        ("IEEE Workshop on Applications of Computer Vision", 2014, "WACV_until_2016"),
     ],
 )
 def test_canonicalize(raw, year, macro):
@@ -118,3 +124,47 @@ def test_categories_drive_entry_type():
     assert canonicalize("IEEE Trans. Pattern Anal. Mach. Intell.").entry_type == "article"
     assert canonicalize("Transactions on Machine Learning Research").entry_type == "article"
     assert canonicalize("Robotics: Science and Systems").entry_type == "inproceedings"
+
+
+@pytest.mark.parametrize(
+    "raw, year, name",
+    [
+        # DBLP's spelling for ICLR 2013-2018 workshop-track papers
+        # (Alain & Bengio, "linear classifier probes").
+        (
+            "ICLR (Workshop)",
+            2017,
+            "International Conference on Learning Representations (ICLR) Workshop Track",
+        ),
+        (
+            "International Conference on Learning Representations Workshop Track",
+            2016,
+            "International Conference on Learning Representations (ICLR) Workshop Track",
+        ),
+        (
+            "ICRA Workshops",
+            2021,
+            "IEEE International Conference on Robotics and Automation (ICRA) Workshops",
+        ),
+        (
+            "NIPS Workshop",
+            2016,
+            "Advances in Neural Information Processing Systems (NIPS) Workshop Track",
+        ),
+    ],
+)
+def test_workshop_track_is_never_the_main_conference(raw, year, name):
+    v = canonicalize(raw, year)
+    assert v is not None, f"no match for {raw!r}"
+    assert v.name == name
+    assert v.category == "workshop"
+    assert v.entry_type == "inproceedings"
+    # The emitted name must read back as itself, so normalize and upgrade
+    # cannot later collapse it onto the main conference.
+    assert canonicalize(v.name, year) == v
+
+
+def test_named_workshop_keeps_its_own_name():
+    # "Workshop on X" is its own venue: the co-located conference's name
+    # does not describe it, and the raw string is kept.
+    assert canonicalize("Proceedings of the Workshop on Foo at ICML 2020") is None

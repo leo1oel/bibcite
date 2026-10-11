@@ -33,6 +33,13 @@ DROP_TOKENS = frozenset(
 # resolve to that entry, which is how "ACM Trans. Graph." became TOCHI.
 ORGANIZATION_ACRONYMS = frozenset("acm ieee cvf rsj acl".split())
 
+# A venue string that mentions a workshop is never the main conference, even
+# when the conference's acronym is the only thing we recognize in it: DBLP files
+# ICLR's 2013-2018 workshop track as "ICLR (Workshop)".
+WORKSHOP = re.compile(r"\bworkshops?\b", re.I)
+# "Workshop on X" names its own venue; a conference's name does not describe it.
+NAMED_WORKSHOP = re.compile(r"\bworkshop\s+(?:on|for|of)\b", re.I)
+
 # Function words that abbreviated venue names drop entirely, as in
 # "Trans. Pattern Anal. Mach. Intell." for "Transactions on Pattern Analysis
 # and Machine Intelligence" (DROP_TOKENS already covers the rest).
@@ -215,7 +222,6 @@ class VenueTable:
         raw = venue.strip()
         n = _norm(raw)
         lowered = re.sub(r"[^a-z0-9]", "", fold_ascii(raw).lower())
-        is_workshoppy = "workshop" in n
 
         macro = None
         # 1. exact normalized-name / alias match
@@ -233,12 +239,9 @@ class VenueTable:
         # 2. the whole string is an acronym (e.g. DBLP venue "CVPR")
         if macro is None and lowered in self._acr:
             macro = self._acr[lowered]
-        # 3. embedded acronyms — prefer workshop variants when applicable
+        # 3. embedded acronyms
         if macro is None:
             for acr in _acronyms(raw):
-                if is_workshoppy and acr + "w" in self._acr:
-                    macro = self._acr[acr + "w"]
-                    break
                 if acr in self._acr:
                     macro = self._acr[acr]
                     break
@@ -250,8 +253,40 @@ class VenueTable:
                     break
         if macro is None:
             return None
+        if WORKSHOP.search(raw) and not self._names_workshop(macro):
+            return self._workshop_of(macro, raw, year)
         macro = self._apply_year_rules(macro, year)
         return self.venues[macro]
+
+    def _names_workshop(self, macro: str) -> bool:
+        """Whether the venue is itself a workshop (CVPRW, the Information
+        Theory Workshop), so a workshop-flavored spelling of it is no track."""
+        v = self.venues[macro]
+        return v.category == "workshop" or bool(WORKSHOP.search(v.name))
+
+    def _workshop_of(self, macro: str, raw: str, year) -> Venue | None:
+        """The workshop venue of a conference matched by a workshop string.
+
+        A table entry for the conference's workshops wins ("ECCV (Workshops)"
+        is ECCVW). A named workshop is its own venue, so the source's string
+        stands. Otherwise the conference has a workshop track the table does
+        not list, cited as such and never as the main conference.
+        """
+        base = self.venues[macro]
+        if base.is_journal:
+            return None
+        variant = self._acr.get(re.sub(r"[^a-z0-9]", "", macro.lower()) + "w")
+        if variant and self.venues[variant].category == "workshop":
+            return self.venues[variant]
+        if NAMED_WORKSHOP.search(raw):
+            return None
+        base = self.venues[self._apply_year_rules(macro, year)]
+        # Echo the source's own term: ICLR had a workshop *track*, while
+        # "ICRA Workshops" are co-located events.
+        track = "Workshops" if re.search(r"\bworkshops\b", raw, re.I) else "Workshop Track"
+        return Venue(
+            macro=f"{base.macro}W", name=f"{base.name} {track}", category="workshop"
+        )
 
     @staticmethod
     def _year_int(year) -> int | None:

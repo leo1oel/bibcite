@@ -219,6 +219,28 @@ def test_matching_an_unchanged_publication_does_not_rewrite_it(tmp_path, monkeyp
     assert bib.read_text() == before
 
 
+def test_a_workshop_track_paper_cited_as_the_main_conference_is_upgraded(
+    tmp_path, monkeypatch
+):
+    bib = tmp_path / "refs.bib"
+    bib.write_text(
+        "@inproceedings{alain2017understanding, title={Understanding intermediate "
+        "layers using linear classifier probes}, eprint={1610.01644}, year={2017}, "
+        "booktitle={International Conference on Learning Representations (ICLR)}}\n"
+    )
+    monkeypatch.setattr(cli, "find_published", lambda *args: (
+        Match(source="dblp", venue="ICLR (Workshop)", title="Understanding "
+              "intermediate layers using linear classifier probes", year="2017"),
+        "found",
+    ))
+    result = cli._upgrade_entries(bib, dry_run=False, include_published_arxiv=True)
+    assert result["upgraded"] == 1
+    assert result["entries"][0]["venue"] == (
+        "International Conference on Learning Representations (ICLR) Workshop Track"
+    )
+    assert "(ICLR) Workshop Track" in bib.read_text()
+
+
 def test_fix_succeeds_when_file_is_clean(tmp_path, monkeypatch):
     bib = tmp_path / "refs.bib"
     bib.write_text(

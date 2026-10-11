@@ -20,6 +20,7 @@ from .normalize import (
 from .sources import (
     ArxivMeta,
     Match,
+    acl_anthology_by_doi,
     arxiv_metadata,
     crossref_by_doi,
     PageUnreadable,
@@ -293,7 +294,13 @@ def resolve(query: str, require_published: bool = False) -> Resolved:
         return Resolved(_finalize(_web_entry(page), None), "webpage", page.site, False)
 
     if kind == "doi":
-        match = crossref_by_doi(value)
+        match = None
+        try:
+            match = acl_anthology_by_doi(value)
+        except Exception as e:
+            _log(f"[acl-anthology] unavailable ({e}); falling back to CrossRef")
+        if match is None or not match.title:
+            match = crossref_by_doi(value)
         if not match or not match.title:
             raise NotFound(f"DOI not found on CrossRef: {value}")
         entry = _entry_from_match(match, None)

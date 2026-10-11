@@ -148,6 +148,8 @@ Mark a confirmed preprint-only entry with `pubstate = {preprint}` if you want `c
 For arXiv IDs and titles, `bibcite` collects paper metadata and checks publication sources in a cascade derived from [PaperMemory](https://github.com/vict0rsch/PaperMemory): DBLP, Semantic Scholar, Crossref, and OpenAlex.
 Google Scholar scraping is excluded so CAPTCHA challenges cannot delay publication lookup.
 A published match must have the same normalized title or pass a guarded title-drift check, have a plausible publication year, and name a non-preprint venue.
+A DOI resolves through Crossref, except ACL Anthology DOIs (`10.18653/v1/...`), which use the Anthology's own BibTeX export because Crossref's copy drops given names; Crossref is the fallback when the Anthology cannot answer.
+Workshop venues, including workshop tracks such as ICLR's, are never canonicalized to the main conference.
 
 DBLP requests are single-attempt, with short connection/read timeouts and a shared four-second scheduling budget for exact and title-drift lookup.
 Socket timeouts apply per network phase, so this budget is not a hard end-to-end deadline.
@@ -205,7 +207,7 @@ uv tool install --editable .
 
 ## Acknowledgements
 
-Inspired by [PaperMemory](https://github.com/vict0rsch/PaperMemory), with formatting by [bibtex-tidy](https://github.com/FlamingTempura/bibtex-tidy) and metadata from arXiv, DBLP, Semantic Scholar, Crossref, and OpenAlex.
+Inspired by [PaperMemory](https://github.com/vict0rsch/PaperMemory), with formatting by [bibtex-tidy](https://github.com/FlamingTempura/bibtex-tidy) and metadata from arXiv, DBLP, Semantic Scholar, Crossref, OpenAlex, and the ACL Anthology.
 
 ## License
 
