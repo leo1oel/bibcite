@@ -3,7 +3,7 @@
 from pathlib import Path
 
 from bibcite.bibfile import MONTH_STRINGS, load_bib_file, upsert_entry, _write_db
-from bibcite.normalize import titles_similar
+from bibcite.normalize import same_paper_title, title_acronym, titles_similar
 
 ARXIV_TITLE = "An Information-Theoretic Perspective on Variance-Invariance-Covariance Regularization"
 PUBLISHED_TITLE = "An Information Theory Perspective on Variance-Invariance-Covariance Regularization"
@@ -19,6 +19,44 @@ def test_titles_similar_rejects_different_papers():
         "An Image is Worth 16x16 Words: Transformers for Image Recognition",
     )
     assert not titles_similar("Deep Residual Learning", "")
+
+
+def test_same_paper_title_accepts_only_camera_ready_rewording():
+    assert same_paper_title(ARXIV_TITLE, PUBLISHED_TITLE)
+    assert same_paper_title("Attention Is All You Need", "attention is all you need")
+    # An acronym dropped or added by the camera-ready version is still the
+    # same paper, as long as the description matches.
+    assert same_paper_title(
+        "UMI on Legs: Making Manipulation Policies Mobile",
+        "UMI-on-Legs: Making Manipulation Policies Mobile",
+    )
+    assert same_paper_title(
+        "HOVER: Versatile Neural Whole-Body Controller for Humanoid Robots",
+        "Versatile Neural Whole-Body Controller for Humanoid Robots",
+    )
+
+
+def test_same_paper_title_separates_papers_that_titles_similar_conflates():
+    # The overlap coefficient scores this pair at exactly its 0.75 threshold,
+    # which is how GMT's entry was overwritten with SONIC's metadata.
+    gmt = "GMT: General Motion Tracking for Humanoid Whole-Body Control"
+    sonic = "SONIC: Supersizing Motion Tracking for Natural Humanoid Whole-Body Control"
+    assert titles_similar(gmt, sonic)
+    assert not same_paper_title(gmt, sonic)
+    # A differing short name is decisive even when the rest is word-for-word.
+    assert not same_paper_title(
+        "GMT: Motion Tracking for Humanoid Whole-Body Control",
+        "SONIC: Motion Tracking for Humanoid Whole-Body Control",
+    )
+    assert not same_paper_title("Deep Residual Learning", "")
+
+
+def test_title_acronym_reads_only_a_short_head():
+    assert title_acronym("GMT: General Motion Tracking") == "gmt"
+    assert title_acronym("UMI-on-Legs: Making Policies Mobile") == "umionlegs"
+    assert title_acronym("Attention Is All You Need") == ""
+    # A long head is a subtitle marker, not a name the paper gave itself.
+    assert title_acronym("An Image is Worth 16x16 Words: Transformers for Vision") == ""
 
 
 ENTRY = {

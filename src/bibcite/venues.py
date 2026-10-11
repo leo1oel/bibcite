@@ -27,6 +27,24 @@ DROP_TOKENS = frozenset(
     "ieee cvf acm rsj the annual proceedings proc of on in".split()
 )
 
+# Publishers and societies that prefix dozens of venue names. They are nobody's
+# acronym, so they must never become one: registering "ACM" from the first
+# ACM-prefixed entry in strings.bib made every unrecognized "ACM ..." string
+# resolve to that entry, which is how "ACM Trans. Graph." became TOCHI.
+ORGANIZATION_ACRONYMS = frozenset("acm ieee cvf rsj acl".split())
+
+# A venue string that mentions a workshop is never the main conference, even
+# when the conference's acronym is the only thing we recognize in it: DBLP files
+# ICLR's 2013-2018 workshop track as "ICLR (Workshop)".
+WORKSHOP = re.compile(r"\bworkshops?\b", re.I)
+# "Workshop on X" names its own venue; a conference's name does not describe it.
+NAMED_WORKSHOP = re.compile(r"\bworkshop\s+(?:on|for|of)\b", re.I)
+
+# Function words that abbreviated venue names drop entirely, as in
+# "Trans. Pattern Anal. Mach. Intell." for "Transactions on Pattern Analysis
+# and Machine Intelligence" (DROP_TOKENS already covers the rest).
+ABBREVIATION_FILLER = frozenset({"and", "for"})
+
 # Hand-written aliases (normalized form -> macro) for spellings the automatic
 # alias generation cannot derive, e.g. DBLP's abbreviated journal names.
 EXTRA_ALIASES = {
@@ -102,15 +120,46 @@ def _norm(s: str) -> str:
 
 def _acronyms(s: str) -> list[str]:
     """Candidate acronyms in a raw venue string: parenthesized chunks and
-    standalone ALL-CAPS tokens, mini-hashed."""
-    cands = re.findall(r"\(([^()]+)\)", s)
-    cands += [t for t in re.split(r"[\s,.:]+", s) if len(t) >= 2 and t.isupper()]
+    standalone ALL-CAPS tokens, mini-hashed.
+
+    A parenthesized chunk is a venue's declared short name and is always
+    trusted; a bare ALL-CAPS token is only a guess, so publisher and society
+    names are not accepted as one.
+    """
+    cands = [(c, True) for c in re.findall(r"\(([^()]+)\)", s)]
+    cands += [
+        (t, False) for t in re.split(r"[\s,.:]+", s) if len(t) >= 2 and t.isupper()
+    ]
     out = []
-    for c in cands:
+    for c, declared in cands:
         c = re.sub(r"[^a-z0-9]", "", fold_ascii(c).lower())
-        if c and c not in out:
-            out.append(c)
+        if not c or c in out:
+            continue
+        if not declared and c in ORGANIZATION_ACRONYMS:
+            continue
+        out.append(c)
     return out
+
+
+def _abbreviation_of(query: str, canonical: str) -> bool:
+    """Whether normalized ``query`` is ``canonical`` with its words truncated —
+    the form DBLP and CrossRef return ("ACM Trans. Graph." for "ACM
+    Transactions on Graphics").
+
+    Every word must be a prefix of the canonical word in the same position, and
+    at least one must actually be shortened, so a differently worded venue can
+    never satisfy it.
+    """
+    q = [t for t in query.split() if t not in ABBREVIATION_FILLER]
+    c = [t for t in canonical.split() if t not in ABBREVIATION_FILLER]
+    if not q or len(q) != len(c):
+        return False
+    shortened = False
+    for word, full in zip(q, c):
+        if not full.startswith(word):
+            return False
+        shortened = shortened or word != full
+    return shortened
 
 
 class VenueTable:
@@ -119,6 +168,7 @@ class VenueTable:
         self._exact: dict[str, str] = {}  # normalized string -> macro
         self._acr: dict[str, str] = {}  # minihashed acronym -> macro
         self._containment: list[tuple[str, str]] = []  # (normalized full, macro)
+        self._names: dict[str, str] = {}  # normalized canonical name -> macro
         self._parse(text)
         self._build_aliases()
 
@@ -148,8 +198,16 @@ class VenueTable:
             n = _norm(v.name)
             if n:
                 self._exact.setdefault(n, macro)
+                self._names.setdefault(n, macro)
                 if len(n.split()) >= 3:
                     self._containment.append((n, macro))
+            else:
+                # A name made entirely of dropped tokens ("Proceedings of the
+                # IEEE") normalizes to nothing, so its full spelling is the
+                # only handle left once organization names stop being acronyms.
+                self._acr.setdefault(
+                    re.sub(r"[^a-z0-9]", "", fold_ascii(v.name).lower()), macro
+                )
         for alias, macro in EXTRA_ALIASES.items():
             self._exact[alias] = macro
         # Longest names first so e.g. ICCVW ("... computer vision workshops")
@@ -164,21 +222,26 @@ class VenueTable:
         raw = venue.strip()
         n = _norm(raw)
         lowered = re.sub(r"[^a-z0-9]", "", fold_ascii(raw).lower())
-        is_workshoppy = "workshop" in n
 
         macro = None
         # 1. exact normalized-name / alias match
         if n in self._exact:
             macro = self._exact[n]
+        # 1b. an abbreviated spelling of a canonical name ("ACM Trans. Graph.").
+        # Only an unambiguous expansion counts: a truncation that fits two
+        # venues is not evidence for either of them.
+        if macro is None:
+            expansions = {
+                m for name, m in self._names.items() if _abbreviation_of(n, name)
+            }
+            if len(expansions) == 1:
+                macro = expansions.pop()
         # 2. the whole string is an acronym (e.g. DBLP venue "CVPR")
         if macro is None and lowered in self._acr:
             macro = self._acr[lowered]
-        # 3. embedded acronyms — prefer workshop variants when applicable
+        # 3. embedded acronyms
         if macro is None:
             for acr in _acronyms(raw):
-                if is_workshoppy and acr + "w" in self._acr:
-                    macro = self._acr[acr + "w"]
-                    break
                 if acr in self._acr:
                     macro = self._acr[acr]
                     break
@@ -190,8 +253,40 @@ class VenueTable:
                     break
         if macro is None:
             return None
+        if WORKSHOP.search(raw) and not self._names_workshop(macro):
+            return self._workshop_of(macro, raw, year)
         macro = self._apply_year_rules(macro, year)
         return self.venues[macro]
+
+    def _names_workshop(self, macro: str) -> bool:
+        """Whether the venue is itself a workshop (CVPRW, the Information
+        Theory Workshop), so a workshop-flavored spelling of it is no track."""
+        v = self.venues[macro]
+        return v.category == "workshop" or bool(WORKSHOP.search(v.name))
+
+    def _workshop_of(self, macro: str, raw: str, year) -> Venue | None:
+        """The workshop venue of a conference matched by a workshop string.
+
+        A table entry for the conference's workshops wins ("ECCV (Workshops)"
+        is ECCVW). A named workshop is its own venue, so the source's string
+        stands. Otherwise the conference has a workshop track the table does
+        not list, cited as such and never as the main conference.
+        """
+        base = self.venues[macro]
+        if base.is_journal:
+            return None
+        variant = self._acr.get(re.sub(r"[^a-z0-9]", "", macro.lower()) + "w")
+        if variant and self.venues[variant].category == "workshop":
+            return self.venues[variant]
+        if NAMED_WORKSHOP.search(raw):
+            return None
+        base = self.venues[self._apply_year_rules(macro, year)]
+        # Echo the source's own term: ICLR had a workshop *track*, while
+        # "ICRA Workshops" are co-located events.
+        track = "Workshops" if re.search(r"\bworkshops\b", raw, re.I) else "Workshop Track"
+        return Venue(
+            macro=f"{base.macro}W", name=f"{base.name} {track}", category="workshop"
+        )
 
     @staticmethod
     def _year_int(year) -> int | None:

@@ -89,7 +89,13 @@ def titles_similar(a: str, b: str, threshold: float = 0.75) -> bool:
     Uses the overlap coefficient (|∩| / min) rather than Jaccard so one
     changed word in a shortish title still matches; very short titles
     (<=3 significant tokens, e.g. "Deep Learning") must match exactly
-    because a single shared word would otherwise dominate."""
+    because a single shared word would otherwise dominate.
+
+    This is a *local* heuristic: flagging near-duplicates in a file, or asking
+    whether a replacement still describes the same paper. Deciding that a
+    remote record may overwrite a local entry needs :func:`same_paper_title`,
+    which does not accept a mere overlap ratio.
+    """
     ta, tb = sig_tokens(a), sig_tokens(b)
     if not ta or not tb:
         return False
@@ -97,6 +103,63 @@ def titles_similar(a: str, b: str, threshold: float = 0.75) -> bool:
     if smaller <= 3:
         return ta == tb
     return len(ta & tb) / smaller >= threshold
+
+
+# A paper's self-given short name, "GMT" in "GMT: General Motion Tracking for
+# Humanoid Whole-Body Control". A colon also introduces an ordinary subtitle,
+# which is not a name, so only a head of at most three words counts.
+_TITLE_HEAD = re.compile(r"^\s*([^:]{1,60}?)\s*:\s*\S", re.S)
+
+
+def title_acronym(title: str) -> str:
+    """The short name a title gives itself before the colon, or ""."""
+    m = _TITLE_HEAD.match(title)
+    if not m:
+        return ""
+    head = m.group(1).strip()
+    return mini_hash(head) if 1 <= len(head.split()) <= 3 else ""
+
+
+def _title_description(title: str) -> str:
+    """The title without its short name — one side of a preprint/camera-ready
+    pair may have added or dropped it."""
+    if not title_acronym(title):
+        return title
+    return title.split(":", 1)[1]
+
+
+def same_paper_title(a: str, b: str) -> bool:
+    """Whether two titles name the SAME paper, tolerating only the wording
+    drift a camera-ready version introduces.
+
+    Deliberately stricter than :func:`titles_similar`, because a false
+    positive here silently swaps one paper's citation for another's. Papers in
+    one subfield share nearly all of their descriptive words: "GMT: General
+    Motion Tracking for Humanoid Whole-Body Control" and "SONIC: Supersizing
+    Motion Tracking for Natural Humanoid Whole-Body Control" share six of the
+    smaller title's eight significant tokens, so no overlap ratio loose enough
+    to accept real drift can also separate those two. Identity has to come
+    from the short name and from a bound on how many words may differ at all.
+    """
+    if not a.strip() or not b.strip():
+        return False
+    if norm_title(a) == norm_title(b):
+        return True
+    # Different self-given names are different papers, however alike the
+    # description that follows them.
+    acronym_a, acronym_b = title_acronym(a), title_acronym(b)
+    if acronym_a and acronym_b and acronym_a != acronym_b:
+        return False
+    ta = sig_tokens(_title_description(a))
+    tb = sig_tokens(_title_description(b))
+    if not ta or not tb:
+        return False
+    # Short descriptions carry too little signal for any tolerance at all.
+    if min(len(ta), len(tb)) <= 3:
+        return ta == tb
+    # Camera-ready drift rewords: "Information-Theoretic" -> "Information
+    # Theory" is one word out on each side. Two independent papers never are.
+    return len(ta - tb) <= 1 and len(tb - ta) <= 1
 
 
 def fix_author_caps(author_field: str) -> str:

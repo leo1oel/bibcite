@@ -28,8 +28,8 @@ from .normalize import (
     first_author_last_name,
     mini_hash,
     norm_title,
+    same_paper_title,
     sig_tokens,
-    titles_similar,
 )
 
 UA = "bibcite/0.6 (https://github.com/leo1oel/bibcite)"
@@ -565,9 +565,14 @@ def _dblp_hit_authors(info: dict) -> list[str]:
 def try_dblp_fuzzy(title: str, author_hint: str, year: str = "") -> Match | None:
     """Title-drift fallback: camera-ready titles often differ from the arXiv
     ones ("Information-Theoretic" -> "Information Theory"), and DBLP's
-    token-AND search then misses entirely. Query the most distinctive
-    title tokens instead, and accept token-Jaccard-similar
-    titles — guarded by author and year so different papers can't sneak in.
+    token-AND search then misses entirely. Query the most distinctive title
+    tokens instead.
+
+    Only the *query* is loose. Acceptance is an identity test — same short
+    name, at most one reworded word, and the same FIRST author — because this
+    is the one publication path where the returned title may differ from the
+    one we asked for, and a wrong hit here rewrites a citation to a different
+    paper.
     """
     if not author_hint:
         return None
@@ -588,14 +593,16 @@ def try_dblp_fuzzy(title: str, author_hint: str, year: str = "") -> Match | None
                 continue
             if not _is_published_venue(str(info.get("venue", ""))):
                 continue
-            if not titles_similar(hit_title, title):
+            if not same_paper_title(hit_title, title):
                 continue
             if year and info.get("year"):
                 if abs(int(info["year"]) - int(year)) > 2:
                     continue
-            if not any(
-                mini_hash(author_hint) == first_author_last_name(name)
-                for name in _dblp_hit_authors(info)
+            # The first author specifically: a shared co-author is no evidence
+            # of identity in a field where the same groups publish repeatedly.
+            hit_authors = _dblp_hit_authors(info)
+            if not hit_authors or mini_hash(author_hint) != first_author_last_name(
+                hit_authors[0]
             ):
                 continue
             match = _dblp_match(info, "dblp-fuzzy")
@@ -994,6 +1001,52 @@ def crossref_by_doi(doi: str) -> Match | None:
 
 
 # ---------------------------------------------------------------------------
+# ACL Anthology by DOI
+# ---------------------------------------------------------------------------
+
+# The Anthology mints 10.18653/v1/<anthology id> for its papers. Crossref's
+# copy of those records loses given names ("Wayne Xin Zhao" becomes "Xin
+# Zhao"), so the Anthology's own export is the record to cite.
+ACL_DOI = re.compile(r"^10\.18653/v1/(\S+)$", re.I)
+
+
+def acl_anthology_by_doi(doi: str) -> Match | None:
+    """The Anthology's BibTeX export for one of its DOIs, or None when the
+    DOI is not an Anthology one or the Anthology has no such entry."""
+    from .bibfile import entry_to_bibtex, parse_bibtex_entry
+
+    m = ACL_DOI.match(doi)
+    if not m:
+        return None
+    anthology_id = m.group(1)
+    # DOIs are case-insensitive but the Anthology's legacy ids ("P19-1001")
+    # are not; its newer ids ("2023.emnlp-main.20") are all lowercase.
+    if re.fullmatch(r"[a-z]\d{2}-\d{4}", anthology_id, re.I):
+        anthology_id = anthology_id.upper()
+    with _client() as c:
+        r = _get(c, f"https://aclanthology.org/{anthology_id}.bib")
+    if r.status_code == 404:
+        return None
+    r.raise_for_status()
+    # The export wraps name lists across indented lines.
+    entry = {k: " ".join(v.split()) for k, v in parse_bibtex_entry(r.text).items()}
+    # The export must describe the DOI we asked for, not whatever the URL
+    # happened to serve.
+    if entry.get("doi", "").lower() != doi.lower():
+        return None
+    return Match(
+        source="acl-anthology",
+        venue=entry.get("booktitle") or entry.get("journal") or "",
+        title=clean_title(entry.get("title", "")),
+        year=entry.get("year", ""),
+        authors=[a.strip() for a in entry.get("author", "").split(" and ") if a.strip()],
+        doi=entry["doi"],
+        bibtex=entry_to_bibtex(entry),
+        url=entry.get("url", ""),
+    )
+
+
+# ---------------------------------------------------------------------------
 # The cascade
 # ---------------------------------------------------------------------------
 
@@ -1066,8 +1119,14 @@ def find_published(
     cache_key = norm_title(title)
     cached = cache.get(cache_key)
     if cached:
-        _log(f"[cache] hit: {cached.get('venue', '')} ({cached.get('source', '')})")
-        return Match(**cached), "found"
+        match = Match(**cached)
+        # A stored record proves only that some earlier run accepted it. Hold it
+        # to the rules in force now, so a matching bug cannot keep serving its
+        # wrong answer from disk after the bug itself is fixed.
+        if same_paper_title(match.title, title) and _is_published_venue(match.venue):
+            _log(f"[cache] hit: {match.venue} ({match.source})")
+            return match, "found"
+        _log(f"[cache] discarding a record that is not this paper: {match.title!r}")
 
     # Core sources lost earlier in this run taint this query's verdict too.
     incomplete = any(n in CORE_SOURCES for n in _DISABLED)
